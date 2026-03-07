@@ -5,7 +5,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$OutputRoot,
 
-    [string]$DecompilerExe = "C:\out\luau_decompiler\build\Release\luau_decompiler.exe",
+    [string]$DecompilerExe = "",
 
     [switch]$Resume,
 
@@ -20,8 +20,23 @@ param(
 
 $ErrorActionPreference = "Stop"
 
+if ([string]::IsNullOrWhiteSpace($DecompilerExe)) {
+    $candidates = @(
+        (Join-Path $PSScriptRoot "luau_decompiler.exe"),
+        (Join-Path $PSScriptRoot "..\\luau_decompiler.exe"),
+        "luau_decompiler.exe"
+    )
+
+    foreach ($candidate in $candidates) {
+        if (Test-Path -LiteralPath $candidate) {
+            $DecompilerExe = $candidate
+            break
+        }
+    }
+}
+
 if (-not (Test-Path -LiteralPath $DecompilerExe)) {
-    throw "Decompiler executable not found: $DecompilerExe"
+    throw "Decompiler executable not found: $DecompilerExe (pass -DecompilerExe <path>)"
 }
 
 if (-not (Test-Path -LiteralPath $SourceRoot)) {

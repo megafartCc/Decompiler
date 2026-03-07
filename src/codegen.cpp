@@ -6,16 +6,16 @@
 #include <unordered_map>
 #include <optional>
 
-// ==========================================
-// Register tracker: tracks what value each register holds
-// ==========================================
+
+
+
 struct RegVal {
     enum Kind { UNKNOWN, NUMBER, STRING, UPVAL, TABLE_ACCESS, FUNC_RESULT, IMPORT, METHOD_CALL };
     Kind kind = UNKNOWN;
     double numVal = 0;
     std::string strVal;
     int upvalIdx = -1;
-    std::string repr; // human-readable representation
+    std::string repr; 
 };
 
 struct RegTracker {
@@ -26,26 +26,26 @@ struct RegTracker {
 };
 
 struct SSATracker {
-    std::unordered_map<int, int> versions; // slot -> current version
-    std::unordered_map<int, std::unordered_map<int, std::string>> semanticNames; // slot -> version -> inferred name
+    std::unordered_map<int, int> versions; 
+    std::unordered_map<int, std::unordered_map<int, std::string>> semanticNames; 
 
-    // Create a new version for the register
+    
     int next(int slot) {
         return ++versions[slot];
     }
 
-    // Get the current version of the register
+    
     int current(int slot) const {
         auto it = versions.find(slot);
         return it != versions.end() ? it->second : 0;
     }
     
-    // Bind a human-readable heuristic name to this specific register version
+    
     void setSemanticName(int slot, int ver, const std::string& name) {
         semanticNames[slot][ver] = name;
     }
     
-    // Retrieve a bound heuristic name if it exists
+    
     std::string getSemanticName(int slot, int ver) const {
         auto slotIt = semanticNames.find(slot);
         if (slotIt != semanticNames.end()) {
@@ -63,33 +63,33 @@ struct SSATracker {
     }
 };
 
-// ==========================================
-// Helpers
-// ==========================================
+
+
+
 static std::string reg(const Function& f, int idx, int pc, const SSATracker& ssa, bool isAssignment = false) {
-    // For parameters, use 'p' prefix
+    
     if (idx < f.numParams) return "p" + std::to_string(idx);
 
-    // For local variables, try to find their debug name
+    
     for (auto& lv : f.locals) {
         if (lv.slot == idx && (pc < 0 || (pc >= lv.startPc && pc < lv.endPc))) {
             int ver = isAssignment ? const_cast<SSATracker&>(ssa).next(idx) : ssa.current(idx);
-            if (ver == 0) return lv.name; // Base uninitialized or param fallback
+            if (ver == 0) return lv.name; 
             return lv.name + "_" + std::to_string(ver);
         }
     }
 
-    // Determine the version
+    
     int ver = isAssignment ? const_cast<SSATracker&>(ssa).next(idx) : ssa.current(idx);
     
-    // HEURISTIC ENGINE: Prioritize checking for inferred Semantic Names!
+    
     std::string semantic = ssa.getSemanticName(idx, ver);
     if (!semantic.empty()) {
         return semantic;
     }
 
-    // Fallback to generic 'v' prefix with SSA version
-    if (ver == 0) return "v" + std::to_string(idx); // Base uninitialized or param fallback
+    
+    if (ver == 0) return "v" + std::to_string(idx); 
     return "v" + std::to_string(idx) + "_" + std::to_string(ver);
 }
 
@@ -110,7 +110,7 @@ static std::string constStr(const Function& f, int idx, const std::vector<std::s
 
 static std::string indent(int level) { return std::string(level * 4, ' '); }
 
-// Escape a string for display, truncating if too long
+
 static std::string escapeStr(const std::string& s, int maxLen = 60) {
     std::string out;
     for (char ch : s) {
@@ -124,16 +124,16 @@ static std::string escapeStr(const std::string& s, int maxLen = 60) {
 
 
 
-// ==========================================
-// Table Folding Engine
-// ==========================================
+
+
+
 struct TableBuffer {
     bool active = false;
     std::string declaration;
-    std::vector<std::pair<std::string, std::string>> entries; // <Key, Value>
+    std::vector<std::pair<std::string, std::string>> entries; 
     bool isListOnly = true;
 
-    // Formats the buffer into a gorgeous inline Lua structure!
+    
     std::string formatInline(const std::string& indentStr) const {
         if (entries.empty()) return "{}";
         
@@ -144,7 +144,7 @@ struct TableBuffer {
         for (size_t i = 0; i < entries.size(); ++i) {
             out << innerInd;
             if (!entries[i].first.empty()) {
-                // Determine if Dictionary Key needs brackets (e.g. non-identifiers or numbers)
+                
                 bool needsBrackets = false;
                 for (char c : entries[i].first) {
                     if (!std::isalnum(c) && c != '_') { needsBrackets = true; break; }
@@ -164,16 +164,16 @@ struct TableBuffer {
     }
 };
 
-// Global tracker for the current function
+
 static std::unordered_map<int, TableBuffer> activeTableBuffers;
 
-// Detects if an expression references a buffered table, flushes it if necessary
+
 static std::string resolveReg(const RegTracker& rt, const Function& f, int slot, int pc, const SSATracker& ssa, bool allowLiteral = true, const std::string& indentStr = "") {
     
-    // HEURISTIC ENGINE: Flush active inline tables seamlessly when they are accessed!
+    
     if (activeTableBuffers.count(slot) && activeTableBuffers[slot].active) {
         std::string folded = activeTableBuffers[slot].formatInline(indentStr);
-        activeTableBuffers.erase(slot); // Mark as consumed
+        activeTableBuffers.erase(slot); 
         return folded;
     }
     
@@ -183,37 +183,37 @@ static std::string resolveReg(const RegTracker& rt, const Function& f, int slot,
     return reg(f, slot, pc, ssa);
 }
 
-// Annotate a string table index with the actual string content (for upval_0[N] lookups)
+
 static std::string strAnnotation(const Chunk& chunk, int idx) {
-    // String table indices are 1-based in references but 0-based in array
+    
     if (idx > 0 && idx <= (int)chunk.strings.size()) {
-        auto& s = chunk.strings[idx - 1]; // adjust for 1-based
+        auto& s = chunk.strings[idx - 1]; 
         if (s.size() > 0 && s.size() <= 40)
             return " --[[ \"" + escapeStr(s, 30) + "\" ]]";
     }
     if (idx >= 0 && idx < (int)chunk.strings.size()) {
-        auto& s = chunk.strings[idx]; // try 0-based
+        auto& s = chunk.strings[idx]; 
         if (s.size() > 0 && s.size() <= 40)
             return " --[[ \"" + escapeStr(s, 30) + "\" ]]";
     }
     return "";
 }
 
-// ==========================================
-// Main code generation
-// ==========================================
+
+
+
 static void emitFunction(std::ostringstream& out, const Chunk& chunk, const OpcodeMap& opmap,
                           const Function& f, int indentLevel) {
     std::string ind = indent(indentLevel);
     std::string ind1 = indent(indentLevel + 1);
 
-    // Function header
+    
     std::string name = f.debugName.empty() ? "(anonymous)" : f.debugName;
     out << ind << "-- ======== proto#" << f.id << " \"" << name << "\"";
     if (f.lineDefined > 0) out << " (line " << f.lineDefined << ")";
     out << " ========\n";
 
-    // Param list
+    
     std::string params;
     SSATracker ssa;
     ssa.clear();
@@ -237,13 +237,13 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
     int numInst = (int)f.instructions.size();
     std::vector<bool> emitted(numInst, false);
     
-    // Block tracking for if/then, for loops
+    
     std::vector<int> blockEnds;
 
-    // HEURISTIC ENGINE: Tracking inferred names and suffixing counts identically
+    
     std::unordered_map<std::string, int> nameCounts;
     
-    // Reset AST Table Folding memory buffer state for this function level!
+    
     activeTableBuffers.clear();
     while (pc < numInst) {
         while (!blockEnds.empty() && pc == blockEnds.back()) {
@@ -261,10 +261,10 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
         int A = inst.a(), B = inst.b(), C = inst.c();
         int16_t D = inst.d();
 
-        // ==========================================
-        // Pattern collapse: GETUPVAL + LOADN + GETTABLE → TABLE[N]
-        // Pattern: getupval rX, N; loadn rY, NUM; gettable rZ, rX, rY
-        // ==========================================
+        
+        
+        
+        
         bool collapsed = false;
         if (stdOp == OP_GETUPVAL && pc + 2 < numInst) {
             auto& next1 = f.instructions[pc + 1];
@@ -272,7 +272,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
             int op1 = opmap.lookup(next1.opcode());
             int op2 = opmap.lookup(next2.opcode());
 
-            // Pattern: GETUPVAL rA, upN → LOADN rB, NUM → GETTABLE rC, rA, rB
+            
             if (op1 == OP_LOADN && op2 == OP_GETTABLE) {
                 int tableReg = A;
                 int idxReg = next1.a();
@@ -283,8 +283,8 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                     std::string upvName = upval(f, B);
                     std::string expr = upvName + "[" + std::to_string(numVal) + "]";
 
-                    // Check if this is ALSO followed by another GETTABLE using the result
-                    // Pattern: result = upval[N] → then used as table in next GETTABLE
+                    
+                    
                     if (pc + 5 < numInst) {
                         auto& n3 = f.instructions[pc + 3];
                         auto& n4 = f.instructions[pc + 4];
@@ -293,7 +293,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                         int op4 = opmap.lookup(n4.opcode());
                         int op5 = opmap.lookup(n5.opcode());
 
-                        // Double chain: GETUPVAL→LOADN→GETTABLE → GETTABLE(result, prev_result)
+                        
                         if (op3 == OP_GETUPVAL && op4 == OP_LOADN && op5 == OP_GETTABLE) {
                             int tr2 = n3.a();
                             int ir2 = n4.a();
@@ -302,7 +302,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                             if (n5.b() == tr2 && n5.c() == ir2) {
                                 std::string expr2 = upval(f, n3.b()) + "[" + std::to_string(nv2) + "]";
 
-                                // Triple chain?
+                                
                                 if (pc + 8 < numInst) {
                                     auto& n6 = f.instructions[pc + 6];
                                     auto& n7 = f.instructions[pc + 7];
@@ -314,7 +314,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                                         int16_t nv3 = n7.d();
                                         std::string expr3 = upval(f, n6.b()) + "[" + std::to_string(nv3) + "]";
                                         out << ind1 << reg(f, n8.a(), pc, ssa) << " = " << expr3 << strAnnotation(chunk, nv3) << "  -- via chain: "
-                                            << expr << " → " << expr2 << " → " << expr3 << "\n";
+                                            << expr << " â†’ " << expr2 << " â†’ " << expr3 << "\n";
                                         RegVal rv; rv.kind = RegVal::TABLE_ACCESS; rv.repr = expr3;
                                         rt.set(n8.a(), rv);
                                         emitted[pc] = emitted[pc+1] = emitted[pc+2] = true;
@@ -349,9 +349,9 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
         }
         if (collapsed) continue;
 
-        // ==========================================
-        // Standard instruction emission
-        // ==========================================
+        
+        
+        
         switch (stdOp) {
             case OP_RETURN:
                 if (B == 0) out << ind1 << "return ...\n";
@@ -367,7 +367,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                 break;
 
             case OP_PREPVARARGS:
-                break; // internal, skip
+                break; 
 
             case OP_LOADNIL: {
                 out << ind1 << reg(f, A, pc, ssa) << " = nil\n";
@@ -378,14 +378,14 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
 
             case OP_LOADB: {
                 std::string val = B ? "true" : "false";
-                // SUPPRESS DIRECT OUTPUT: Rely on AST tracking inline resolution!
+                
                 if (C != 0) out << ind1 << "-- skip " << C << " instructions\n";
                 RegVal rv; rv.kind = RegVal::NUMBER; rv.repr = val; rt.set(A, rv);
                 break;
             }
 
             case OP_LOADN: {
-                // SUPPRESS DIRECT OUTPUT: Rely on AST tracking inline resolution!
+                
                 RegVal rv; rv.kind = RegVal::NUMBER; rv.numVal = D; rv.repr = std::to_string(D);
                 rt.set(A, rv);
                 break;
@@ -393,7 +393,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
             case OP_GETGLOBAL: {
                 uint32_t aux = f.instructions[++pc].value;
                 std::string glb = constStr(f, aux, chunk.strings);
-                // INLINER: Cache globally as string pointer, DO NOT spam intermediate assignments!
+                
                 RegVal rv; rv.kind = RegVal::UNKNOWN; rv.repr = glb; rt.set(A, rv);
                 break;
             }
@@ -405,7 +405,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
 
             case OP_LOADK: {
                 std::string val = constStr(f, D, chunk.strings);
-                // SUPPRESS DIRECT OUTPUT: Rely on AST tracking inline resolution!
+                
                 RegVal rv; rv.kind = RegVal::STRING; rv.repr = val;
                 rt.set(A, rv);
                 break;
@@ -431,8 +431,8 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                 uint32_t aux = f.instructions[++pc].value;
                 std::string imp = "import(...)";
                 
-                // V6 imports store the 30-bit importId in 'aux', NOT the constants array index!
-                // We must scan the constants pool to find the matching Import definition.
+                
+                
                 for (const auto& c : f.constants) {
                     if (c.type == ConstantType::Import && c.importId == aux) {
                         imp = c.toString(chunk.strings);
@@ -441,23 +441,23 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                 }
 
                 out << ind1 << reg(f, A, pc, ssa, true) << " = " << imp << "\n";
-                // NOTE: Do NOT use INLINER cache. Global APIs like 'game' or 'math' must be explicitly declared
-                // so subsequent NAMECALL/CALL operations can resolve them properly instead of printing 'Kxxxx' table names!
+                
+                
                 RegVal rv; rv.kind = RegVal::UNKNOWN; rv.repr = imp; rt.set(A, rv);
                 break;
             }
 
             case OP_GETTABLE: {
                 std::string expr = resolveReg(rt, f, B, pc, ssa, true, ind1) + "[" + resolveReg(rt, f, C, pc, ssa, true, ind1) + "]";
-                // INLINER: Cache as table access!
+                
                 RegVal rv; rv.kind = RegVal::TABLE_ACCESS; rv.repr = expr; rt.set(A, rv);
                 break;
             }
             case OP_SETTABLE: {
                 if (activeTableBuffers.count(B) && activeTableBuffers[B].active) {
-                    // Inject natively into memory buffer as [C]=A Dictionary formatting
+                    
                     std::string keyExpr = resolveReg(rt, f, C, pc, ssa, true, ind1); 
-                    // To prevent `"1" = val` output inside the dict, we format properly
+                    
                     activeTableBuffers[B].isListOnly = false;
                     activeTableBuffers[B].entries.push_back({keyExpr, resolveReg(rt, f, A, pc, ssa, true, ind1)});
                 } else {
@@ -468,9 +468,9 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
             case OP_GETTABLEKS: {
                 uint32_t aux = f.instructions[++pc].value;
                 std::string key = constStr(f, aux, chunk.strings);
-                // INLINER: Allow parsing underlying global table literals like 'game.Players' inside GETTABLEKS
+                
                 std::string expr = resolveReg(rt, f, B, pc, ssa, true, ind1) + "." + key;
-                // INLINER: Cache as object property, block assignment printing!
+                
                 RegVal rv; rv.kind = RegVal::TABLE_ACCESS; rv.repr = expr; rt.set(A, rv);
                 break;
             }
@@ -484,7 +484,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                 }
                 
                 if (activeTableBuffers.count(B) && activeTableBuffers[B].active) {
-                    // Inject directly into the Table folding buffer
+                    
                     activeTableBuffers[B].isListOnly = false;
                     activeTableBuffers[B].entries.push_back({key, resolveReg(rt, f, A, pc, ssa, true, ind1)});
                 } else {
@@ -501,7 +501,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                     if (aux < f.constants.size() && f.constants[aux].type == ConstantType::String)
                         method = f.constants[aux].strVal;
                 }
-                std::string obj = resolveReg(rt, f, B, pc, ssa, true); // INLINER: Allow literal string lookup for Namcalls
+                std::string obj = resolveReg(rt, f, B, pc, ssa, true); 
                 RegVal rv1; rv1.kind = RegVal::METHOD_CALL; rv1.repr = obj + ":" + method;
                 rt.set(A, rv1);
                 pc++;
@@ -509,9 +509,9 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
             }
 
             case OP_CALL: {
-                std::string func = resolveReg(rt, f, A, pc, ssa, true); // INLINER: Allow literal lookup for Call handles
+                std::string func = resolveReg(rt, f, A, pc, ssa, true); 
                 std::string argsStr;
-                std::string firstArgLiterals; // HEURISTIC ENGINE hook
+                std::string firstArgLiterals; 
                 bool isMethod = (rt.get(A).kind == RegVal::METHOD_CALL);
                 if (B == 0) {
                     argsStr = "...";
@@ -521,33 +521,33 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                         if (i > startArg) argsStr += ", ";
                         std::string arg = resolveReg(rt, f, A + i, pc, ssa);
                         argsStr += arg;
-                        if (i == startArg) firstArgLiterals = arg; // Capture the first real arg
+                        if (i == startArg) firstArgLiterals = arg; 
                     }
                 }
                 
-                // HEURISTIC ENGINE: Intercept and bind human-readable names to the results of APIs!
+                
                 if (C > 1 && !firstArgLiterals.empty()) {
                     std::string cleanArg = firstArgLiterals;
-                    // Strip the double quotes if they exist around the argument
+                    
                     if (cleanArg.size() >= 2 && cleanArg.front() == '"' && cleanArg.back() == '"') {
                         cleanArg = cleanArg.substr(1, cleanArg.size() - 2);
                     }
                     
                     std::string inferredName = "";
                     if (func == "Instance.new") {
-                        inferredName = cleanArg; // e.g. "Frame" 
+                        inferredName = cleanArg; 
                     } else if (func.find(":GetService") != std::string::npos) {
-                        inferredName = cleanArg; // e.g. "TweenService"
+                        inferredName = cleanArg; 
                     }
                     
-                    // Bind the inferred name cleanly to the output SSA version!
+                    
                     if (!inferredName.empty()) {
                         int currentVersionForRet = ssa.current(A);
                         int count = ++nameCounts[inferredName];
                         std::string finalName = inferredName;
-                        if (count > 1) finalName += "_" + std::to_string(count); // "Frame_2"
-                        // Since 'isAssignment=true' inside 'reg()' handles incrementing the version, 
-                        // we must pre-emptively bind the NEXT version.
+                        if (count > 1) finalName += "_" + std::to_string(count); 
+                        
+                        
                         ssa.setSemanticName(A, currentVersionForRet + 1, finalName);
                     }
                 }
@@ -572,7 +572,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                         if (i > 0) results += ", ";
                         results += reg(f, A + i, pc, ssa, true);
                         
-                        // Heuristic: Ensure returned Tables are flushed and formatted properly
+                        
                         if (activeTableBuffers.count(A+i)) {
                             results += " = " + activeTableBuffers[A+i].formatInline(ind1);
                             activeTableBuffers.erase(A+i);
@@ -580,7 +580,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                     }
                     out << ind1 << results << " = " << func << "(" << argsStr << ")\n";
                 }
-                // Invalidate result registers
+                
                 for (int i = 0; i < (C == 0 ? 10 : C - 1); i++) rt.set(A + i, {});
                 break;
             }
@@ -594,7 +594,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
 
             case OP_DUPCLOSURE: {
                 if (D >= 0 && D < (int)f.constants.size() && f.constants[D].type == ConstantType::Closure) {
-                    out << ind1 << reg(f, A, pc, ssa, true) << " = function() -- closure → proto#" << f.constants[D].closureIdx << "\n";
+                    out << ind1 << reg(f, A, pc, ssa, true) << " = function() -- closure â†’ proto#" << f.constants[D].closureIdx << "\n";
                 } else {
                     out << ind1 << reg(f, A, pc, ssa, true) << " = closure(K" << D << ")\n";
                 }
@@ -609,8 +609,8 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                 break;
 
             case OP_JUMP:
-                // Is this an else block jump? If it jumps exactly over a block, it might be.
-                // For now, if we hit a raw forward jump, maybe we just emit a goto unless we can structure it.
+                
+                
                 if (D > 0) {
                     out << ind1 << "-- goto skip " << D << "\n";
                     blockEnds.push_back(pc + D + 1); indentLevel++; ind1 = indent(indentLevel + 1);
@@ -618,7 +618,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                 break;
 
             case OP_JUMPBACK:
-                // out << ind1 << "continue? loop back to " << (pc + D + 1) << "\n";
+                
                 break;
 
             case OP_JUMPIF:
@@ -744,7 +744,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                 std::string lhs = reg(f, B, pc, ssa);
                 std::string rhs = constStr(f, C, chunk.strings);
                 
-                // Track literal constants into registers (no inline numerical replacement for math branches)
+                
                 if (dest == lhs && !dest.empty() && dest.find("v") != 0 && dest.find_first_of(".[") != std::string::npos) out << ind1 << dest << compoundOps[idx] << rhs << "\n";
                 else if (dest == lhs && dest.find("v") != 0) out << ind1 << dest << compoundOps[idx] << rhs << "\n";
                 else out << ind1 << dest << " = " << lhs << ops[idx] << rhs << "\n";
@@ -764,7 +764,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                 out << ind1 << reg(f, A, pc, ssa) << " = #" << resolveReg(rt, f, B, pc, ssa, true, ind1) << "\n"; rt.set(A, {}); break;
 
             case OP_NEWTABLE:
-                // out << ind1 << reg(f, A, pc, ssa) << " = {}\n"; 
+                
                 activeTableBuffers[A].active = true;
                 activeTableBuffers[A].declaration = "{}";
                 rt.set(A, {}); pc++; break;
@@ -782,14 +782,14 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                 break;
             }
             case OP_FORNLOOP:
-                // Handled by block stack end
+                
                 break;
             case OP_FORGPREP:
             case OP_FORGPREP_NEXT:
             case OP_FORGPREP_INEXT: {
                 std::string iter = resolveReg(rt, f, A, pc, ssa);
                 out << ind1 << "for v" << A+3 << ", v" << A+4 << " in " << iter << " do\n";
-                // FORGPREP jumps exactly over the loop body to FORGLOOP
+                
                 blockEnds.push_back(pc + D + 2); indentLevel++; ind1 = indent(indentLevel + 1);
                 break;
             }
@@ -829,7 +829,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                 pc++; break;
             }
             case OP_DUPTABLE:
-                // out << ind1 << reg(f, A, pc, ssa) << " = {--[[template K" << D << "]]}\n"; 
+                
                 activeTableBuffers[A].active = true;
                 activeTableBuffers[A].declaration = "{--[[template K" + std::to_string(D) + "]]}";
                 rt.set(A, {}); break;
@@ -849,7 +849,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
             }
             case OP_JUMPXEQKN: case OP_JUMPXEQKS: {
                 uint32_t raw_aux = f.instructions[++pc].value;
-                uint32_t aux = raw_aux & 0xFFFFFF; // Mask upper V6 flags
+                uint32_t aux = raw_aux & 0xFFFFFF; 
                 out << ind1 << "if " << resolveReg(rt, f, A, pc, ssa, false) << " == " << constStr(f, aux, chunk.strings) << " then\n";
                 blockEnds.push_back(pc + D + 1); indentLevel++; ind1 = indent(indentLevel + 1);
                 break;
@@ -875,10 +875,10 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                     rt.set(A, {});
                     break;
                 }
-                // Unknown opcode: minimal annotation
+                
                 out << ind1 << "-- [OP" << (int)inst.opcode() << "] "
-                    << reg(f, A, pc, ssa) << " ← ?(B=" << B << ", C=" << C << ", D=" << D << ")\n";
-                rt.set(A, {}); // invalidate
+                    << reg(f, A, pc, ssa) << " â† ?(B=" << B << ", C=" << C << ", D=" << D << ")\n";
+                rt.set(A, {}); 
                 break;
         }
         pc++;
@@ -903,14 +903,14 @@ std::string generateCode(const Chunk& chunk, const OpcodeMap& opmap) {
     out << "-- Opcodes mapped: " << opmap.totalMapped << "/" << OP_COUNT << "\n";
     out << "-- ============================================\n\n";
 
-    // Emit interesting strings from the string table
+    
     out << "-- Notable strings in bytecode:\n";
     int shown = 0;
     for (size_t i = 0; i < chunk.strings.size() && shown < 40; i++) {
         auto& s = chunk.strings[i];
         if (s.size() >= 3 && s.size() <= 80) {
             bool interesting = false;
-            // Check if it looks like an API name (has uppercase letter, not base64)
+            
             for (char ch : s) if (ch >= 'A' && ch <= 'Z' && s.find('=') == std::string::npos) { interesting = true; break; }
             if (s == "game" || s == "math" || s == "table" || s == "task" || s == "pcall" || s == "pairs") interesting = true;
             if (s == "anticheat" || s == "detection") interesting = true;

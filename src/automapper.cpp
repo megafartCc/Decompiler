@@ -49,11 +49,11 @@ OpcodeMap autoDetectOpcodes(const Chunk& chunk) {
     memset(m.confidence, 0, sizeof(m.confidence));
     m.totalMapped = 0;
 
-    // ==========================================
-    // DETERMINISTIC MAPPING using encode_key=203
-    // Formula: standard = (shuffled * 203) % 256
-    // Inverse: shuffled = (standard * 227) % 256
-    // ==========================================
+    
+    
+    
+    
+    
     
     fprintf(stderr, "[mapper] Using deterministic encode_key=203\n");
     
@@ -67,7 +67,7 @@ OpcodeMap autoDetectOpcodes(const Chunk& chunk) {
 
     fprintf(stderr, "[mapper] Mapped all %d opcodes deterministically\n", m.totalMapped);
     
-    // Print key mappings for verification
+    
     fprintf(stderr, "[mapper] LOADK      = OP%d\n", m.fromStd[OP_LOADK]);
     fprintf(stderr, "[mapper] NAMECALL   = OP%d\n", m.fromStd[OP_NAMECALL]);
     fprintf(stderr, "[mapper] CALL       = OP%d\n", m.fromStd[OP_CALL]);

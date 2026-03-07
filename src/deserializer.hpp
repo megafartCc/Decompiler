@@ -4,9 +4,9 @@
 #include <vector>
 #include <optional>
 
-// ==========================================
-// Luau Bytecode Data Structures
-// ==========================================
+
+
+
 
 enum class ConstantType : uint8_t {
     Nil     = 0,
@@ -24,14 +24,14 @@ struct Constant {
     bool   boolVal  = false;
     double numVal   = 0.0;
     std::string strVal;
-    // Import: packed id
+    
     uint32_t importId = 0;
     std::vector<std::string> importNames;
-    // Table: key indices
+    
     std::vector<int> tableKeys;
-    // Closure: proto index
+    
     int closureIdx   = 0;
-    // Vector
+    
     float vecX = 0, vecY = 0, vecZ = 0, vecW = 0;
 
     std::string toString(const std::vector<std::string>& strings) const;
@@ -68,11 +68,11 @@ struct Function {
     std::vector<Constant> constants;
     std::vector<int> childProtos;
     
-    // Debug info
+    
     std::vector<LocalVarInfo> locals;
     std::vector<std::string> upvalueNames;
     
-    // Line info
+    
     bool hasLineInfo = false;
     uint8_t lineGapLog = 0;
     std::vector<uint8_t> lineOffsets;
@@ -87,5 +87,5 @@ struct Chunk {
     int mainIndex;
 };
 
-// Deserialize raw bytes into a Chunk
+
 Chunk deserialize(const uint8_t* data, size_t size);

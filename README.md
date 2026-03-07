@@ -8,36 +8,19 @@ Fast C++ Luau bytecode decompiler with:
 - strict structured output mode
 - batch tree decompile script
 
-## Install
+## Install (Windows)
 
-### Option 1: Download Release (Recommended)
+1. Open **Releases**.
+2. Download `luau_decompiler-win64.zip`.
+3. Extract it.
+4. Run `luau_decompiler.exe`.
 
-1. Go to **Releases**.
-2. Download the latest `luau_decompiler-win64.zip`.
-3. Extract and run `luau_decompiler.exe`.
-
-### Option 2: Build From Source
-
-Requirements:
-
-- CMake 3.16+
-- Visual Studio Build Tools (C++17) on Windows
-
-Build:
-
-```powershell
-cmake -S . -B build -DCMAKE_BUILD_TYPE=Release
-cmake --build build --config Release
-```
-
-Binary output:
-
-`build\Release\luau_decompiler.exe`
+This repository is release-first. Downloading the release zip is the supported install path.
 
 ## Usage
 
 ```powershell
-luau_decompiler.exe [--raw|--cfg|--ir|--ssa|--ast|--strict-structured] <file.luac> [output.lua]
+.\luau_decompiler.exe [--raw|--cfg|--ir|--ssa|--ast|--strict-structured] <file.luac> [output.lua]
 ```
 
 Modes:
@@ -51,17 +34,24 @@ Modes:
 
 ## Batch Decompile Directory Trees
 
-Use:
+If you are using the release zip, run:
 
-`tools/decompile_tree.ps1`
+```powershell
+powershell -ExecutionPolicy Bypass -File .\decompile_tree.ps1 `
+  -SourceRoot "C:\path\to\dump" `
+  -OutputRoot "C:\path\to\out" `
+  -Jobs 8 `
+  -StrictStructured `
+  -AllowRawFallback
+```
 
-Example:
+If you are running from this source repo, run:
 
 ```powershell
 powershell -ExecutionPolicy Bypass -File tools\decompile_tree.ps1 `
   -SourceRoot "C:\path\to\dump" `
   -OutputRoot "C:\path\to\out" `
-  -DecompilerExe ".\build\Release\luau_decompiler.exe" `
+  -DecompilerExe "C:\path\to\luau_decompiler.exe" `
   -Jobs 8 `
   -StrictStructured `
   -AllowRawFallback

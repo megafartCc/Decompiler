@@ -3,9 +3,9 @@
 #include <cstdio>
 #include <cmath>
 
-// ==========================================
-// Constant::toString
-// ==========================================
+
+
+
 std::string Constant::toString(const std::vector<std::string>& strings) const {
     switch (type) {
         case ConstantType::Nil:     return "nil";
@@ -15,7 +15,7 @@ std::string Constant::toString(const std::vector<std::string>& strings) const {
                 return "0/0";
             if (std::isinf(numVal))
                 return numVal < 0 ? "-math.huge" : "math.huge";
-            // Pretty print integers vs floats
+            
             if (numVal == (double)(int64_t)numVal && std::abs(numVal) < 1e15)
                 return std::to_string((int64_t)numVal);
             char buf[64];
@@ -45,9 +45,9 @@ std::string Constant::toString(const std::vector<std::string>& strings) const {
     return "<?>";
 }
 
-// ==========================================
-// Deserializer
-// ==========================================
+
+
+
 static std::string readStringRef(BytecodeReader& r, const std::vector<std::string>& strings) {
     int id = r.readVarInt();
     if (id == 0 || id > (int)strings.size()) return "";
@@ -136,13 +136,13 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
         int typesSize = r.readVarInt();
         r.skip(typesSize);
 
-        // Handle types version specific data (skip)
+        
         if (typesVersion == 1) {
-            // Already skipped via typesSize above
+            
         }
     }
 
-    // Instructions (uint32 each)
+    
     {
         int count = r.readVarInt();
         f.instructions.reserve(count);
@@ -153,7 +153,7 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
         }
     }
 
-    // Constants
+    
     {
         int count = r.readVarInt();
         f.constants.reserve(count);
@@ -162,7 +162,7 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
         }
     }
 
-    // Child proto indices
+    
     {
         int count = r.readVarInt();
         for (int i = 0; i < count; i++)
@@ -172,7 +172,7 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
     f.lineDefined = r.readVarInt();
     f.debugName   = readStringRef(r, strings);
 
-    // Line info
+    
     if (r.readBool()) {
         f.hasLineInfo = true;
         f.lineGapLog = r.readByte();
@@ -194,7 +194,7 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
         }
     }
 
-    // Debug info
+    
     if (r.readBool()) {
         int sizeVars = r.readVarInt();
         for (int i = 0; i < sizeVars; i++) {
@@ -219,14 +219,14 @@ Chunk deserialize(const uint8_t* data, size_t size) {
 
     chunk.version = r.readByte();
 
-    // Version 0 means error message follows
+    
     if (chunk.version == 0) {
         std::string err;
         while (!r.eof()) err += (char)r.readByte();
         throw std::runtime_error("Bytecode contains error: " + err);
     }
     
-    // Bypass version check since the official compiler uses v255 (which maps to v6)
+    
     if (chunk.version == 255) chunk.version = 6;
 
     fprintf(stderr, "[*] Bytecode version: %d\n", chunk.version);
@@ -235,11 +235,11 @@ Chunk deserialize(const uint8_t* data, size_t size) {
     if (chunk.version >= 4)
         chunk.typesVersion = r.readByte();
 
-    // String table
+    
     chunk.strings = readStringTable(r);
     fprintf(stderr, "[*] Loaded %zu strings\n", chunk.strings.size());
 
-    // Types version 3: userdata remapping (skip)
+    
     if (chunk.typesVersion == 3) {
         uint8_t idx = r.readByte();
         while (idx != 0) {
@@ -248,7 +248,7 @@ Chunk deserialize(const uint8_t* data, size_t size) {
         }
     }
 
-    // Functions
+    
     int funcCount = r.readVarInt();
     fprintf(stderr, "[*] Loading %d functions\n", funcCount);
     chunk.functions.reserve(funcCount);

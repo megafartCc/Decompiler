@@ -2842,7 +2842,7 @@ static std::vector<AstStatement> buildRegionList(ExpressionContext& context, int
 
     return block.body;
 }
-} // namespace
+}
 
 AstFunction structureFunction(const Chunk& chunk, const Function& sourceFunction, const OpcodeMap& opmap,
                               const std::vector<std::string>& upvalueAliases) {

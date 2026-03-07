@@ -503,7 +503,7 @@ static bool isNoOpSelfAssignmentText(const std::string& text) {
         return false;
     }
 
-    // Keep global-script aliasing in function prologs if it was explicit source shape.
+    
     if (isLocal && lhs == "script") {
         return true;
     }
@@ -549,7 +549,7 @@ static bool isSideEffectFreeInlineExpression(const std::string& expr) {
         return false;
     }
 
-    // Keep this conservative: call-like expressions need deeper parsing.
+    
     if (trimmed.find('(') != std::string::npos || trimmed.find(')') != std::string::npos) {
         return false;
     }
@@ -844,7 +844,7 @@ static void rewriteLoopHeaderUnusedVars(AstStatement& statement) {
     std::string varList = trimWhitespace(body.substr(0, inPos));
     std::string iteratorExpr = trimWhitespace(body.substr(inPos + 4));
     if (varList.empty() || iteratorExpr.empty() || varList.find('=') != std::string::npos) {
-        // Numeric loops are kept as-is.
+        
         return;
     }
 
@@ -1150,7 +1150,7 @@ static void renderIfStatement(std::ostringstream& out, const AstStatement& state
 
     out << ind << "end\n";
 }
-} // namespace
+} 
 
 static void renderFunction(std::ostringstream& out, const AstFunction& function, bool anonymous,
                            const std::string& explicitName, int baseIndentLevel) {

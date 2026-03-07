@@ -647,7 +647,7 @@ static std::string inferUsageDrivenBaseName(const SSAFunction& function, int val
     }
     return bestScore >= 3 ? best : "";
 }
-} // namespace
+} 
 
 void inferNames(SSAFunction& function, const Function& sourceFunction, const std::vector<std::string>& upvalueAliases) {
     std::unordered_map<std::string, int> usedNames;

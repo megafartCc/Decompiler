@@ -45,7 +45,7 @@ double BytecodeReader::readDouble() {
     return val;
 }
 
-// Luau varint: 7 bits per byte, MSB = continuation
+
 int32_t BytecodeReader::readVarInt() {
     uint32_t result = 0;
     int shift = 0;

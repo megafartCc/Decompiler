@@ -23,8 +23,8 @@ static std::vector<uint8_t> readFile(const char* path) {
 }
 
 static void stripHeader(std::vector<uint8_t>& data) {
-    // FINALDUMPer prepends "-- Script: ..." text to bytecode files
-    // Detect and strip: look for first byte after a newline that could be a version
+    
+    
     if (data.size() > 4 && data[0] == '-' && data[1] == '-') {
         for (size_t i = 0; i < data.size() - 1; i++) {
             if (data[i] == '\n') {
@@ -119,12 +119,12 @@ int main(int argc, char* argv[]) {
         auto data = readFile(inputPath);
         fprintf(stderr, "[*] File size: %zu bytes\n", data.size());
         
-        // Version explicit whitelist check
-        // uint8_t version = data.size() > 0 ? data[0] : 0;
-        // if (version != 6 && version != 255) {
-        //      fprintf(stderr, "[!] Error: Unsupported bytecode version\n");
-        //      return 1;
-        // }
+        
+        
+        
+        
+        
+        
 
         stripHeader(data);
 

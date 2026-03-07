@@ -304,7 +304,7 @@ static std::unordered_map<int, std::vector<int>> computePreciseCallClobbers(
 
         auto assignUnknown = [&](int slot) {
             if (slot >= 0 && slot < slotCount) {
-                out.insert(kUnknownClosure * (slotCount + 1) - slot - 1); // per-slot unknown marker
+                out.insert(kUnknownClosure * (slotCount + 1) - slot - 1); 
             }
         };
         auto clearUnknown = [&](int slot) {
@@ -596,9 +596,9 @@ static SlotAccess analyzeSlotAccess(const Function& function, const DecodedInstr
                 addRange(access.defs, inst.a, inst.c - 1);
             }
             for (int slot : callClobberSlots) {
-                // OPEN-result calls (C==0) conceptually overwrite the return window from A upward.
-                // Keep those slots untouched here so loop-iterator/result recovery can still reason
-                // about returned registers; upvalue-cell clobbers still apply.
+                
+                
+                
                 if (inst.c == 0 && slot >= inst.a && slot < function.maxStackSize) {
                     continue;
                 }
@@ -881,7 +881,7 @@ static void renameBlock(SSAFunction& ssa, const Function& function, int blockId,
         }
     }
 }
-} // namespace
+} 
 
 SSAFunction buildSSAFunction(const Chunk& chunk, const Function& function, const OpcodeMap& opmap) {
     SSAFunction ssa;

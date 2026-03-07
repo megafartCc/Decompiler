@@ -3,11 +3,11 @@
 #include <iomanip>
 #include <cstdio>
 
-// ==========================================
-// Standard Luau OpCode names (open-source Luau order)
-// Roblox shuffles these, but we print both the raw value
-// AND the standard name if it matches
-// ==========================================
+
+
+
+
+
 static const char* STANDARD_OPNAMES[] = {
     "NOP", "BREAK", "LOADNIL", "LOADB", "LOADN", "LOADK", "MOVE",
     "GETGLOBAL", "SETGLOBAL", "GETUPVAL", "SETUPVAL", "CLOSEUPVALS",
@@ -60,11 +60,11 @@ std::string disassemble(const Chunk& chunk, const OpcodeMap* opmap) {
     out << "-- Main: proto#" << chunk.mainIndex << "\n";
     out << "-- ============================================\n\n";
 
-    // Dump string table
+    
     out << "-- ============ STRING TABLE ============\n";
     for (size_t i = 0; i < chunk.strings.size(); i++) {
         auto& s = chunk.strings[i];
-        // Escape non-printable chars
+        
         std::string escaped;
         for (char ch : s) {
             if (ch >= 32 && ch < 127) escaped += ch;
@@ -79,7 +79,7 @@ std::string disassemble(const Chunk& chunk, const OpcodeMap* opmap) {
     }
     out << "\n";
 
-    // Dump each function
+    
     for (auto& f : chunk.functions) {
         out << "-- ============ FUNCTION proto#" << f.id << " ============\n";
         out << "-- Name: " << (f.debugName.empty() ? "(anonymous)" : f.debugName) << "\n";
@@ -92,7 +92,7 @@ std::string disassemble(const Chunk& chunk, const OpcodeMap* opmap) {
             << "  Constants: " << f.constants.size()
             << "  Children: " << f.childProtos.size() << "\n";
 
-        // Local variables
+        
         if (!f.locals.empty()) {
             out << "-- Locals:\n";
             for (auto& lv : f.locals) {
@@ -106,7 +106,7 @@ std::string disassemble(const Chunk& chunk, const OpcodeMap* opmap) {
                 out << "--   [" << i << "] " << f.upvalueNames[i] << "\n";
         }
 
-        // Constants
+        
         if (!f.constants.empty()) {
             out << "-- Constants:\n";
             for (size_t i = 0; i < f.constants.size(); i++) {
@@ -114,7 +114,7 @@ std::string disassemble(const Chunk& chunk, const OpcodeMap* opmap) {
             }
         }
 
-        // Instructions (raw disassembly)
+        
         out << "\n";
         for (int pc = 0; pc < (int)f.instructions.size(); pc++) {
             auto& inst = f.instructions[pc];
@@ -125,7 +125,7 @@ std::string disassemble(const Chunk& chunk, const OpcodeMap* opmap) {
             char hexStr[16];
             snprintf(hexStr, sizeof(hexStr), "%08X", inst.value);
 
-            // Print: [pc] line hex OP(raw_id) A B C / D
+            
             uint8_t rawOp = inst.opcode();
             int mappedOp = opmap ? opmap->lookup(rawOp) : ((rawOp < NUM_STANDARD_OPS) ? rawOp : -1);
             const char* opName = (mappedOp >= 0 && mappedOp < NUM_STANDARD_OPS) ? STANDARD_OPNAMES[mappedOp] : "???";
@@ -142,18 +142,18 @@ std::string disassemble(const Chunk& chunk, const OpcodeMap* opmap) {
                 out << "  ; mapped=" << opName;
             }
 
-            // Annotate with constant references where possible
-            // LOADK: A = K[D]
+            
+            
             if (mappedOp == 5 && inst.d() >= 0 && inst.d() < (int)f.constants.size()) {
                 out << "  ; " << getLocalName(f, inst.a(), pc) << " = "
                     << f.constants[inst.d()].toString(chunk.strings);
             }
-            // GETIMPORT: A = import K[D]
+            
             else if (mappedOp == 12 && inst.d() >= 0 && inst.d() < (int)f.constants.size()) {
                 out << "  ; " << getLocalName(f, inst.a(), pc) << " = import "
                     << f.constants[inst.d()].toString(chunk.strings);
             }
-            // LOADN: A = D (number literal)
+            
             else if (mappedOp == 4) {
                 out << "  ; " << getLocalName(f, inst.a(), pc) << " = " << inst.d();
             }

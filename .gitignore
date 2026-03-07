@@ -1,0 +1,10 @@
+build/
+out/
+release_assets/
+*.obj
+*.pdb
+*.ilk
+*.exp
+*.lib
+*.exe
+*.zip

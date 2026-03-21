@@ -1,7 +1,9 @@
 #include "ast.hpp"
+#include <algorithm>
 #include <cctype>
 #include <cstring>
 #include <optional>
+#include <regex>
 #include <set>
 #include <sstream>
 
@@ -296,6 +298,64 @@ static bool isSimpleBreakIf(const AstStatement& statement, std::string& conditio
     return !condition.empty();
 }
 
+static std::string combineBreakGuardConditions(const std::vector<std::string>& conditions) {
+    if (conditions.empty()) {
+        return "false";
+    }
+    if (conditions.size() == 1) {
+        return normalizeConditionText(conditions.front());
+    }
+    std::ostringstream out;
+    for (size_t i = 0; i < conditions.size(); ++i) {
+        if (i) {
+            out << " or ";
+        }
+        out << parenthesizeCondition(conditions[i]);
+    }
+    return normalizeConditionText(out.str());
+}
+
+static std::optional<std::string> consumeLeadingBreakGuards(std::vector<AstStatement>& body) {
+    std::vector<std::string> conditions;
+    size_t count = 0;
+    while (count < body.size()) {
+        std::string condition;
+        if (!isSimpleBreakIf(body[count], condition)) {
+            break;
+        }
+        conditions.push_back(condition);
+        ++count;
+    }
+
+    if (conditions.empty()) {
+        return std::nullopt;
+    }
+
+    body.erase(body.begin(), body.begin() + (long long)count);
+    return combineBreakGuardConditions(conditions);
+}
+
+static std::optional<std::string> consumeTrailingBreakGuards(std::vector<AstStatement>& body) {
+    std::vector<std::string> conditions;
+    size_t count = 0;
+    for (size_t idx = body.size(); idx > 0; --idx) {
+        std::string condition;
+        if (!isSimpleBreakIf(body[idx - 1], condition)) {
+            break;
+        }
+        conditions.push_back(condition);
+        ++count;
+    }
+
+    if (conditions.empty()) {
+        return std::nullopt;
+    }
+
+    std::reverse(conditions.begin(), conditions.end());
+    body.erase(body.end() - (long long)count, body.end());
+    return combineBreakGuardConditions(conditions);
+}
+
 static std::string negateConditionText(const std::string& value) {
     std::string trimmed = trimWhitespace(value);
     if (trimmed.empty()) {
@@ -390,6 +450,32 @@ static bool isIdentifierBoundary(char ch) {
     return !(std::isalnum((unsigned char)ch) || ch == '_');
 }
 
+static std::optional<size_t> findSimpleAssignmentOperator(const std::string& text) {
+    int depth = 0;
+    for (size_t i = 0; i < text.size(); ++i) {
+        char ch = text[i];
+        if (ch == '(') {
+            ++depth;
+            continue;
+        }
+        if (ch == ')') {
+            --depth;
+            continue;
+        }
+        if (depth != 0 || ch != '=') {
+            continue;
+        }
+
+        char prev = i > 0 ? text[i - 1] : '\0';
+        char next = (i + 1 < text.size()) ? text[i + 1] : '\0';
+        if (prev == '=' || prev == '<' || prev == '>' || prev == '~' || next == '=') {
+            continue;
+        }
+        return i;
+    }
+    return std::nullopt;
+}
+
 static bool isNumericLiteralText(const std::string& value) {
     std::string trimmed = trimWhitespace(value);
     if (trimmed.empty()) {
@@ -440,11 +526,68 @@ static bool replaceIdentifierOnce(std::string& text, const std::string& identifi
         return false;
     }
 
+    auto isDottedIdentifierPathLocal = [](const std::string& value) {
+        if (value.empty()) {
+            return false;
+        }
+        size_t start = 0;
+        while (start < value.size()) {
+            size_t dot = value.find('.', start);
+            std::string segment = dot == std::string::npos
+                ? value.substr(start)
+                : value.substr(start, dot - start);
+            segment = trimWhitespace(segment);
+            if (!isLuaIdentifierText(segment)) {
+                return false;
+            }
+            if (dot == std::string::npos) {
+                return true;
+            }
+            start = dot + 1;
+        }
+        return false;
+    };
+
     size_t pos = 0;
     while ((pos = text.find(identifier, pos)) != std::string::npos) {
         bool leftBoundary = pos == 0 || isIdentifierBoundary(text[pos - 1]);
         bool rightBoundary = (pos + identifier.size() >= text.size()) || isIdentifierBoundary(text[pos + identifier.size()]);
         if (leftBoundary && rightBoundary) {
+            auto simpleAssignPos = findSimpleAssignmentOperator(text);
+            if (simpleAssignPos.has_value() && pos < *simpleAssignPos) {
+                pos += identifier.size();
+                continue;
+            }
+
+            std::string trimmedReplacement = trimWhitespace(replacement);
+            bool replacementIsSimpleMemberName = isLuaIdentifierText(trimmedReplacement);
+
+            // Avoid statement-leading parenthesized replacement forms that trigger ambiguous parse
+            // ("looks like function-call args") in Luau.
+            if (pos == 0 && !trimmedReplacement.empty() && trimmedReplacement.front() == '(') {
+                pos += identifier.size();
+                continue;
+            }
+
+            // Avoid invalid `obj.(expr)` / `obj:(expr)` artifacts.
+            if (pos > 0 && (text[pos - 1] == '.' || text[pos - 1] == ':') && !replacementIsSimpleMemberName) {
+                pos += identifier.size();
+                continue;
+            }
+
+            // Avoid invalid receiver forms like `nil:Disconnect()` and `0.5.X`.
+            size_t nextPos = pos + identifier.size();
+            if (nextPos < text.size() && (text[nextPos] == '.' || text[nextPos] == ':')) {
+                bool safeReceiver = !trimmedReplacement.empty() &&
+                    (trimmedReplacement.front() == '(' ||
+                     isLuaIdentifierText(trimmedReplacement) ||
+                     isDottedIdentifierPathLocal(trimmedReplacement));
+                if (!safeReceiver || trimmedReplacement == "nil") {
+                    pos += identifier.size();
+                    continue;
+                }
+            }
+
             text.replace(pos, identifier.size(), replacement);
             return true;
         }
@@ -455,8 +598,11 @@ static bool replaceIdentifierOnce(std::string& text, const std::string& identifi
 
 static bool replaceSingleUseIdentifierInStatement(AstStatement& statement, const std::string& identifier,
                                                   const std::string& replacement) {
-    if (replaceIdentifierOnce(statement.text, identifier, replacement)) {
-        return true;
+    if (!(statement.kind == AstStatementKind::Raw &&
+          trimWhitespace(statement.text).rfind("local ", 0) == 0)) {
+        if (replaceIdentifierOnce(statement.text, identifier, replacement)) {
+            return true;
+        }
     }
     if (replaceIdentifierOnce(statement.header, identifier, replacement)) {
         return true;
@@ -503,7 +649,7 @@ static bool isNoOpSelfAssignmentText(const std::string& text) {
         return false;
     }
 
-    
+    // Keep global-script aliasing in function prologs if it was explicit source shape.
     if (isLocal && lhs == "script") {
         return true;
     }
@@ -532,6 +678,46 @@ static int countIdentifierUsesInTail(const std::vector<AstStatement>& statements
     return uses;
 }
 
+static bool referencesIdentifierInBreakGuard(const AstStatement& statement, const std::string& identifier) {
+    if (identifier.empty()) {
+        return false;
+    }
+
+    if (statement.kind == AstStatementKind::If && statement.elseBody.empty() &&
+        statement.body.size() == 1 && isBareBreak(statement.body.front()) &&
+        countIdentifierOccurrences(statement.header, identifier) > 0) {
+        return true;
+    }
+
+    if (statement.kind == AstStatementKind::Loop &&
+        (countIdentifierOccurrences(statement.header, identifier) > 0 ||
+         countIdentifierOccurrences(statement.footer, identifier) > 0)) {
+        return true;
+    }
+
+    for (const auto& child : statement.body) {
+        if (referencesIdentifierInBreakGuard(child, identifier)) {
+            return true;
+        }
+    }
+    for (const auto& child : statement.elseBody) {
+        if (referencesIdentifierInBreakGuard(child, identifier)) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool identifierUsedAsControlFlowGuardInTail(const std::vector<AstStatement>& statements, size_t fromIndex,
+                                                   const std::string& identifier) {
+    for (size_t i = fromIndex; i < statements.size(); ++i) {
+        if (referencesIdentifierInBreakGuard(statements[i], identifier)) {
+            return true;
+        }
+    }
+    return false;
+}
+
 static bool isSideEffectFreeInlineExpression(const std::string& expr) {
     std::string trimmed = trimWhitespace(expr);
     if (trimmed.empty()) {
@@ -549,8 +735,32 @@ static bool isSideEffectFreeInlineExpression(const std::string& expr) {
         return false;
     }
 
-    
+    // Keep this conservative: call-like expressions need deeper parsing.
     if (trimmed.find('(') != std::string::npos || trimmed.find(')') != std::string::npos) {
+        return false;
+    }
+
+    return true;
+}
+
+static bool isSingleEvalConditionInlineExpression(const std::string& expr) {
+    std::string trimmed = trimWhitespace(expr);
+    if (trimmed.empty()) {
+        return false;
+    }
+
+    if (trimmed.find('\n') != std::string::npos || trimmed.find('\r') != std::string::npos) {
+        return false;
+    }
+
+    if (trimmed.find("function") != std::string::npos ||
+        trimmed.find("...") != std::string::npos) {
+        return false;
+    }
+
+    // Keep assignment-like expressions out of condition inlining.
+    if (trimmed.find('=') != std::string::npos ||
+        trimmed.find(";") != std::string::npos) {
         return false;
     }
 
@@ -837,54 +1047,73 @@ static void rewriteLoopHeaderUnusedVars(AstStatement& statement) {
     const size_t bodyEnd = header.size() - 3;
     std::string body = trimWhitespace(header.substr(bodyStart, bodyEnd - bodyStart));
     size_t inPos = body.find(" in ");
-    if (inPos == std::string::npos) {
+    if (inPos != std::string::npos) {
+        std::string varList = trimWhitespace(body.substr(0, inPos));
+        std::string iteratorExpr = trimWhitespace(body.substr(inPos + 4));
+        if (varList.empty() || iteratorExpr.empty() || varList.find('=') != std::string::npos) {
+            return;
+        }
+
+        std::vector<std::string> vars = splitCommaSeparated(varList);
+        if (vars.empty()) {
+            return;
+        }
+
+        bool changed = false;
+        for (auto& var : vars) {
+            if (var.empty() || var == "_" || !isLuaIdentifierText(var)) {
+                continue;
+            }
+            int uses = 0;
+            for (const auto& child : statement.body) {
+                uses += countIdentifierUsesInStatement(child, var);
+            }
+            if (uses == 0) {
+                var = "_";
+                changed = true;
+            }
+        }
+
+        if (!changed) {
+            return;
+        }
+
+        while (vars.size() > 1 && vars.back() == "_") {
+            vars.pop_back();
+        }
+
+        std::ostringstream rebuiltVars;
+        for (size_t i = 0; i < vars.size(); ++i) {
+            if (i) {
+                rebuiltVars << ", ";
+            }
+            rebuiltVars << vars[i];
+        }
+
+        statement.header = "for " + rebuiltVars.str() + " in " + iteratorExpr + " do";
         return;
     }
 
-    std::string varList = trimWhitespace(body.substr(0, inPos));
-    std::string iteratorExpr = trimWhitespace(body.substr(inPos + 4));
-    if (varList.empty() || iteratorExpr.empty() || varList.find('=') != std::string::npos) {
-        
+    size_t eqPos = body.find('=');
+    if (eqPos == std::string::npos) {
         return;
     }
 
-    std::vector<std::string> vars = splitCommaSeparated(varList);
-    if (vars.empty()) {
+    std::string loopVar = trimWhitespace(body.substr(0, eqPos));
+    std::string rangeExpr = trimWhitespace(body.substr(eqPos + 1));
+    if (loopVar.empty() || loopVar == "_" || !isLuaIdentifierText(loopVar) || rangeExpr.empty()) {
         return;
     }
 
-    bool changed = false;
-    for (auto& var : vars) {
-        if (var.empty() || var == "_" || !isLuaIdentifierText(var)) {
-            continue;
-        }
-        int uses = 0;
-        for (const auto& child : statement.body) {
-            uses += countIdentifierUsesInStatement(child, var);
-        }
-        if (uses == 0) {
-            var = "_";
-            changed = true;
-        }
+    int uses = 0;
+    for (const auto& child : statement.body) {
+        uses += countIdentifierUsesInStatement(child, loopVar);
     }
-
-    if (!changed) {
+    if (uses != 0) {
         return;
     }
 
-    while (vars.size() > 1 && vars.back() == "_") {
-        vars.pop_back();
-    }
-
-    std::ostringstream rebuiltVars;
-    for (size_t i = 0; i < vars.size(); ++i) {
-        if (i) {
-            rebuiltVars << ", ";
-        }
-        rebuiltVars << vars[i];
-    }
-
-    statement.header = "for " + rebuiltVars.str() + " in " + iteratorExpr + " do";
+    statement.header = "for _ = " + rangeExpr + " do";
 }
 
 static bool inlineIfConditionFromLocal(AstStatement& ifStatement, const std::string& varName, const std::string& expr) {
@@ -914,7 +1143,7 @@ static void inlineSingleUseTemps(std::vector<AstStatement>& statements) {
     while (i + 1 < statements.size()) {
         std::string varName;
         std::string expr;
-        if (!parseSimpleLocalAssignment(statements[i], varName, expr) || !isSideEffectFreeInlineExpression(expr)) {
+        if (!parseSimpleLocalAssignment(statements[i], varName, expr)) {
             ++i;
             continue;
         }
@@ -923,9 +1152,25 @@ static void inlineSingleUseTemps(std::vector<AstStatement>& statements) {
             ++i;
             continue;
         }
+        if (identifierUsedAsControlFlowGuardInTail(statements, i + 1, varName)) {
+            ++i;
+            continue;
+        }
 
-        bool inlined = inlineIfConditionFromLocal(statements[i + 1], varName, expr);
+        bool inlined = false;
+        if (isSingleEvalConditionInlineExpression(expr)) {
+            inlined = inlineIfConditionFromLocal(statements[i + 1], varName, expr);
+        }
         if (!inlined) {
+            if (!isSideEffectFreeInlineExpression(expr)) {
+                ++i;
+                continue;
+            }
+            std::string trimmedExpr = trimWhitespace(expr);
+            if (trimmedExpr == "nil" || trimmedExpr == "true" || trimmedExpr == "false") {
+                ++i;
+                continue;
+            }
             const std::string replacement = inlineReplacementExpr(expr);
             for (size_t j = i + 1; j < statements.size() && !inlined; ++j) {
                 inlined = replaceSingleUseIdentifierInStatement(statements[j], varName, replacement);
@@ -938,6 +1183,28 @@ static void inlineSingleUseTemps(std::vector<AstStatement>& statements) {
         }
 
         statements.erase(statements.begin() + i);
+    }
+}
+
+static void removeRedundantConsecutiveLocalAssignments(std::vector<AstStatement>& statements) {
+    if (statements.size() < 2) {
+        return;
+    }
+
+    size_t i = 1;
+    while (i < statements.size()) {
+        std::string prevVar;
+        std::string prevExpr;
+        std::string currVar;
+        std::string currExpr;
+        bool prevOk = parseSimpleLocalAssignment(statements[i - 1], prevVar, prevExpr);
+        bool currOk = parseSimpleLocalAssignment(statements[i], currVar, currExpr);
+        if (prevOk && currOk && prevVar == currVar &&
+            trimWhitespace(prevExpr) == trimWhitespace(currExpr)) {
+            statements.erase(statements.begin() + (long long)i);
+            continue;
+        }
+        ++i;
     }
 }
 
@@ -962,6 +1229,7 @@ static std::vector<AstStatement> simplifyStatements(std::vector<AstStatement> st
     }
 
     inlineSingleUseTemps(simplified);
+    removeRedundantConsecutiveLocalAssignments(simplified);
 
     if (trimTrailingBareReturn) {
         while (!simplified.empty() && isBareReturn(simplified.back())) {
@@ -1030,14 +1298,11 @@ static AstStatement simplifyStatement(AstStatement statement) {
             }
             statement.body = simplifyStatements(std::move(statement.body), false);
             if (statement.header == "while true do" && statement.footer.empty() && !statement.body.empty()) {
-                std::string condition;
-                if (isSimpleBreakIf(statement.body.front(), condition)) {
-                    statement.header = "while " + negateConditionText(condition) + " do";
-                    statement.body.erase(statement.body.begin());
-                } else if (isSimpleBreakIf(statement.body.back(), condition)) {
+                if (auto leadingGuards = consumeLeadingBreakGuards(statement.body); leadingGuards.has_value()) {
+                    statement.header = "while " + negateConditionText(*leadingGuards) + " do";
+                } else if (auto trailingGuards = consumeTrailingBreakGuards(statement.body); trailingGuards.has_value()) {
                     statement.header = "repeat";
-                    statement.footer = "until " + condition;
-                    statement.body.pop_back();
+                    statement.footer = "until " + normalizeConditionText(*trailingGuards);
                 }
             }
             rewriteLoopHeaderUnusedVars(statement);
@@ -1072,12 +1337,37 @@ static void renderStatement(std::ostringstream& out, const AstStatement& stateme
             return;
         }
 
+        std::string previousTrimmedLine;
         size_t start = 0;
         while (start <= text.size()) {
             size_t end = text.find('\n', start);
             std::string line = end == std::string::npos ? text.substr(start) : text.substr(start, end - start);
             if (!line.empty()) {
-                out << ind << line << "\n";
+                std::string trimmed = trimWhitespace(line);
+                bool startsParenExpr = !trimmed.empty() && trimmed.front() == '(';
+                bool continuationContext = false;
+                if (!previousTrimmedLine.empty()) {
+                    char tail = previousTrimmedLine.back();
+                    continuationContext = (tail == '{' || tail == '(' || tail == ',' || tail == '[' || tail == '=');
+                }
+                if (startsParenExpr && !continuationContext) {
+                    static const std::regex kParenedCalleeCall(R"(^\(([A-Za-z_][A-Za-z0-9_\.]*)\)\((.*)\)$)");
+                    std::smatch callMatch;
+                    if (std::regex_match(trimmed, callMatch, kParenedCalleeCall)) {
+                        size_t firstNonWhitespace = line.find_first_not_of(" \t");
+                        std::string leadingWhitespace = firstNonWhitespace == std::string::npos
+                            ? ""
+                            : line.substr(0, firstNonWhitespace);
+                        out << ind << leadingWhitespace << callMatch[1].str() << "(" << callMatch[2].str() << ")\n";
+                    } else if (trimmed.rfind("(function", 0) == 0) {
+                        out << ind << "local _ = " << line << "\n";
+                    } else {
+                        out << ind << line << "\n";
+                    }
+                } else {
+                    out << ind << line << "\n";
+                }
+                previousTrimmedLine = trimmed;
             } else {
                 out << "\n";
             }
@@ -1150,7 +1440,7 @@ static void renderIfStatement(std::ostringstream& out, const AstStatement& state
 
     out << ind << "end\n";
 }
-} 
+} // namespace
 
 static void renderFunction(std::ostringstream& out, const AstFunction& function, bool anonymous,
                            const std::string& explicitName, int baseIndentLevel) {

@@ -5,7 +5,7 @@ param(
     [Parameter(Mandatory = $true)]
     [string]$OutputRoot,
 
-    [string]$DecompilerExe = "",
+    [string]$DecompilerExe = "C:\out\luau_decompiler\build\Release\luau_decompiler.exe",
 
     [switch]$Resume,
 
@@ -20,23 +20,8 @@ param(
 
 $ErrorActionPreference = "Stop"
 
-if ([string]::IsNullOrWhiteSpace($DecompilerExe)) {
-    $candidates = @(
-        (Join-Path $PSScriptRoot "luau_decompiler.exe"),
-        (Join-Path $PSScriptRoot "..\\luau_decompiler.exe"),
-        "luau_decompiler.exe"
-    )
-
-    foreach ($candidate in $candidates) {
-        if (Test-Path -LiteralPath $candidate) {
-            $DecompilerExe = $candidate
-            break
-        }
-    }
-}
-
 if (-not (Test-Path -LiteralPath $DecompilerExe)) {
-    throw "Decompiler executable not found: $DecompilerExe (pass -DecompilerExe <path>)"
+    throw "Decompiler executable not found: $DecompilerExe"
 }
 
 if (-not (Test-Path -LiteralPath $SourceRoot)) {
@@ -51,6 +36,8 @@ if ((Test-Path -LiteralPath $OutputRoot) -and -not $Resume) {
 if (-not (Test-Path -LiteralPath $OutputRoot)) {
     New-Item -ItemType Directory -Path $OutputRoot | Out-Null
 }
+$resolvedOutputRoot = [System.IO.Path]::GetFullPath($OutputRoot)
+$resolvedDecompilerExe = [System.IO.Path]::GetFullPath($DecompilerExe)
 
 $luacFiles = Get-ChildItem -LiteralPath $resolvedSourceRoot -Recurse -File -Filter *.luac | Sort-Object FullName
 $otherFiles = Get-ChildItem -LiteralPath $resolvedSourceRoot -Recurse -File | Where-Object { $_.Extension -ne '.luac' } | Sort-Object FullName
@@ -63,7 +50,7 @@ $reservedOutputPaths = New-Object 'System.Collections.Generic.HashSet[string]' (
 foreach ($bytecodeFile in $luacFiles) {
     $relativePath = $bytecodeFile.FullName.Substring($resolvedSourceRoot.Length).TrimStart('\')
     $outputRelativePath = [System.IO.Path]::ChangeExtension($relativePath, '.lua')
-    $reservedPath = Join-Path $OutputRoot $outputRelativePath
+    $reservedPath = Join-Path $resolvedOutputRoot $outputRelativePath
     [void]$reservedOutputPaths.Add($reservedPath)
 }
 
@@ -75,12 +62,12 @@ function Invoke-Decompile {
     try {
         $ErrorActionPreference = "Continue"
         if ($VerboseDecompiler) {
-            & $DecompilerExe @Arguments
-        } else {
-            & $DecompilerExe @Arguments > $null 2> $null
-        }
-        return $LASTEXITCODE
-    } finally {
+                        & $resolvedDecompilerExe @Arguments
+                    } else {
+                        & $resolvedDecompilerExe @Arguments > $null 2> $null
+                    }
+                    return $LASTEXITCODE
+                } finally {
         $ErrorActionPreference = $prevErrorAction
     }
 }
@@ -103,7 +90,7 @@ if ($Jobs -le 1 -or $luacFiles.Count -le 1) {
         }
         $relativePath = $file.FullName.Substring($resolvedSourceRoot.Length).TrimStart('\')
         $outputRelativePath = [System.IO.Path]::ChangeExtension($relativePath, '.lua')
-        $outputPath = Join-Path $OutputRoot $outputRelativePath
+        $outputPath = Join-Path $resolvedOutputRoot $outputRelativePath
         $rawFallbackPath = [System.IO.Path]::ChangeExtension($outputPath, '.raw.txt')
         $outputDir = Split-Path -Parent $outputPath
 
@@ -161,8 +148,8 @@ if ($Jobs -le 1 -or $luacFiles.Count -le 1) {
         $jobArgs = @()
         $jobArgs += ,$batch
         $jobArgs += $resolvedSourceRoot
-        $jobArgs += $OutputRoot
-        $jobArgs += $DecompilerExe
+        $jobArgs += $resolvedOutputRoot
+        $jobArgs += $resolvedDecompilerExe
         $jobArgs += [bool]$Resume
         $jobArgs += [bool]$VerboseDecompiler
         $jobArgs += [bool]$StrictStructured
@@ -172,8 +159,8 @@ if ($Jobs -le 1 -or $luacFiles.Count -le 1) {
             param(
                 [string[]]$Batch,
                 [string]$ResolvedSourceRoot,
-                [string]$OutputRootParam,
-                [string]$DecompilerExeParam,
+                [string]$ResolvedOutputRoot,
+                [string]$ResolvedDecompilerExe,
                 [bool]$ResumeParam,
                 [bool]$VerboseDecompilerParam,
                 [bool]$StrictStructuredParam,
@@ -186,9 +173,9 @@ if ($Jobs -le 1 -or $luacFiles.Count -le 1) {
                 try {
                     $ErrorActionPreference = "Continue"
                     if ($VerboseDecompilerParam) {
-                        & $DecompilerExeParam @Arguments
+                        & $ResolvedDecompilerExe @Arguments
                     } else {
-                        & $DecompilerExeParam @Arguments > $null 2> $null
+                        & $ResolvedDecompilerExe @Arguments > $null 2> $null
                     }
                     return $LASTEXITCODE
                 } finally {
@@ -213,7 +200,7 @@ if ($Jobs -le 1 -or $luacFiles.Count -le 1) {
                 }
                 $relativePath = $filePath.Substring($ResolvedSourceRoot.Length).TrimStart('\')
                 $outputRelativePath = [System.IO.Path]::ChangeExtension($relativePath, '.lua')
-                $outputPath = Join-Path $OutputRootParam $outputRelativePath
+                $outputPath = Join-Path $ResolvedOutputRoot $outputRelativePath
                 $rawFallbackPath = [System.IO.Path]::ChangeExtension($outputPath, '.raw.txt')
                 $outputDir = Split-Path -Parent $outputPath
 
@@ -292,7 +279,7 @@ foreach ($file in $otherFiles) {
         continue
     }
     $relativePath = $file.FullName.Substring($resolvedSourceRoot.Length).TrimStart('\')
-    $outputPath = Join-Path $OutputRoot $relativePath
+    $outputPath = Join-Path $resolvedOutputRoot $relativePath
     if ($reservedOutputPaths.Contains($outputPath)) {
         $copyWarnings += [pscustomobject]@{
             File = $file.FullName
@@ -323,9 +310,9 @@ foreach ($file in $otherFiles) {
 $resultsJson = if ($results.Count -gt 0) { $results | ConvertTo-Json -Depth 3 } else { "[]" }
 $errorsJson = if ($errors.Count -gt 0) { $errors | ConvertTo-Json -Depth 3 } else { "[]" }
 $copyWarningsJson = if ($copyWarnings.Count -gt 0) { $copyWarnings | ConvertTo-Json -Depth 3 } else { "[]" }
-$resultsJson | Set-Content -Path (Join-Path $OutputRoot "_decompile_results.json")
-$errorsJson | Set-Content -Path (Join-Path $OutputRoot "_decompile_errors.json")
-$copyWarningsJson | Set-Content -Path (Join-Path $OutputRoot "_copy_warnings.json")
+$resultsJson | Set-Content -Path (Join-Path $resolvedOutputRoot "_decompile_results.json")
+$errorsJson | Set-Content -Path (Join-Path $resolvedOutputRoot "_decompile_errors.json")
+$copyWarningsJson | Set-Content -Path (Join-Path $resolvedOutputRoot "_copy_warnings.json")
 
 Write-Host "[done] Decompiled $($luacFiles.Count - $errors.Count) of $($luacFiles.Count) bytecode files"
 Write-Host "[done] Copied $($otherFiles.Count) non-bytecode files"

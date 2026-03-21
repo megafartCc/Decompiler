@@ -1,18 +1,64 @@
 #include "structurer.hpp"
 #include "identifier_utils.hpp"
+#include "codegen.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cctype>
+#include <cstdio>
 #include <functional>
+#include <future>
+#include <limits>
 #include <optional>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
 #include <unordered_set>
 
+template <typename Formatter>
+static std::vector<std::string> formatFunctionsParallel(const std::vector<Function>& functions, Formatter&& formatter) {
+    const size_t functionCount = functions.size();
+    std::vector<std::string> chunks(functionCount);
+    if (functionCount == 0) {
+        return chunks;
+    }
+
+    unsigned int workerCount = std::thread::hardware_concurrency();
+    if (workerCount == 0) {
+        workerCount = 4;
+    }
+    workerCount = (unsigned int)std::min<size_t>(workerCount, functionCount);
+    if (workerCount <= 1 || functionCount < 4) {
+        for (size_t i = 0; i < functionCount; ++i) {
+            chunks[i] = formatter(functions[i]);
+        }
+        return chunks;
+    }
+
+    std::atomic<size_t> nextIndex{0};
+    std::vector<std::future<void>> workers;
+    workers.reserve(workerCount);
+    for (unsigned int worker = 0; worker < workerCount; ++worker) {
+        workers.push_back(std::async(std::launch::async, [&]() {
+            while (true) {
+                size_t index = nextIndex.fetch_add(1);
+                if (index >= functionCount) {
+                    break;
+                }
+                chunks[index] = formatter(functions[index]);
+            }
+        }));
+    }
+    for (auto& worker : workers) {
+        worker.get();
+    }
+    return chunks;
+}
+
+namespace {
 static AstFunction structureFunctionWithAliases(const Chunk& chunk, const Function& sourceFunction, const OpcodeMap& opmap,
                                                 const std::vector<std::string>& upvalueAliases,
                                                 const std::unordered_map<int, std::vector<std::string>>& aliasesByFunction);
 
-namespace {
 struct TableEntry {
     std::optional<std::string> namedKey;
     std::optional<int> numericKey;
@@ -113,8 +159,172 @@ static bool needsMethodReceiverParens(const std::string& expression) {
     return false;
 }
 
+static bool needsCallCalleeParens(const std::string& expression) {
+    std::string trimmed = trimSpace(expression);
+    if (trimmed.empty() || trimmed.front() == '(') {
+        return false;
+    }
+    if (trimmed.rfind("function", 0) == 0 ||
+        trimmed.find('\n') != std::string::npos ||
+        trimmed.find('\r') != std::string::npos) {
+        return true;
+    }
+    char first = trimmed.front();
+    if (std::isalpha(static_cast<unsigned char>(first)) || first == '_') {
+        return false;
+    }
+    return true;
+}
+
 static bool isIdentifierKey(const std::string& value) {
     return isLuaIdentifier(value);
+}
+
+static bool isQualifiedIdentifierPath(const std::string& value) {
+    if (value.empty()) {
+        return false;
+    }
+    size_t start = 0;
+    while (start < value.size()) {
+        size_t dot = value.find('.', start);
+        std::string segment = dot == std::string::npos
+            ? value.substr(start)
+            : value.substr(start, dot - start);
+        if (!isLuaIdentifier(segment)) {
+            return false;
+        }
+        if (dot == std::string::npos) {
+            return true;
+        }
+        start = dot + 1;
+    }
+    return false;
+}
+
+static std::string escapeLuaStringLiteral(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for (unsigned char ch : value) {
+        switch (ch) {
+            case '\\':
+                escaped += "\\\\";
+                break;
+            case '\"':
+                escaped += "\\\"";
+                break;
+            case '\n':
+                escaped += "\\n";
+                break;
+            case '\r':
+                escaped += "\\r";
+                break;
+            case '\t':
+                escaped += "\\t";
+                break;
+            default:
+                if (ch < 32 || ch == 127) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\x%02X", static_cast<unsigned int>(ch));
+                    escaped += buf;
+                } else {
+                    escaped.push_back(static_cast<char>(ch));
+                }
+                break;
+        }
+    }
+    return "\"" + escaped + "\"";
+}
+
+static bool needsIndexBaseParens(const std::string& expression) {
+    std::string trimmed = trimSpace(expression);
+    if (trimmed.empty() || trimmed.front() == '(') {
+        return false;
+    }
+
+    int parenDepth = 0;
+    int bracketDepth = 0;
+    int braceDepth = 0;
+    bool inString = false;
+    char stringQuote = '\0';
+    bool escaped = false;
+
+    for (char ch : trimmed) {
+        if (inString) {
+            if (escaped) {
+                escaped = false;
+                continue;
+            }
+            if (ch == '\\') {
+                escaped = true;
+                continue;
+            }
+            if (ch == stringQuote) {
+                inString = false;
+            }
+            continue;
+        }
+
+        if (ch == '"' || ch == '\'') {
+            inString = true;
+            stringQuote = ch;
+            continue;
+        }
+
+        if (ch == '(') {
+            ++parenDepth;
+            continue;
+        }
+        if (ch == ')') {
+            --parenDepth;
+            continue;
+        }
+        if (ch == '[') {
+            ++bracketDepth;
+            continue;
+        }
+        if (ch == ']') {
+            --bracketDepth;
+            continue;
+        }
+        if (ch == '{') {
+            ++braceDepth;
+            continue;
+        }
+        if (ch == '}') {
+            --braceDepth;
+            continue;
+        }
+
+        if (parenDepth == 0 && bracketDepth == 0 && braceDepth == 0) {
+            if (std::isspace(static_cast<unsigned char>(ch)) ||
+                ch == '+' || ch == '-' || ch == '*' || ch == '/' || ch == '%' ||
+                ch == '^' || ch == '#' || ch == '<' || ch == '>' || ch == '=') {
+                return true;
+            }
+        }
+    }
+
+    if (trimmed == "nil" || trimmed == "true" || trimmed == "false") {
+        return true;
+    }
+
+    char first = trimmed.front();
+    return !(std::isalpha(static_cast<unsigned char>(first)) || first == '_');
+}
+
+static std::string indexBase(const std::string& expression) {
+    return needsIndexBaseParens(expression) ? ("(" + expression + ")") : expression;
+}
+
+static std::string formatIndexAccess(std::string objectExpr, std::string keyExpr) {
+    return indexBase(objectExpr) + "[" + keyExpr + "]";
+}
+
+static std::string formatNamedFieldAccess(std::string objectExpr, const std::string& key) {
+    if (isIdentifierKey(key)) {
+        return indexBase(objectExpr) + "." + key;
+    }
+    return formatIndexAccess(std::move(objectExpr), escapeLuaStringLiteral(key));
 }
 
 static const SSAInstruction* definingInstruction(const SSAFunction& function, int valueId) {
@@ -210,7 +420,7 @@ static bool isRegisterLikeAlias(const std::string& alias);
 static bool isSyntheticParameterAlias(const std::string& alias);
 static bool hasNumericSuffix(const std::string& alias);
 static std::string stripNumericSuffix(std::string alias);
-static int aliasQuality(const std::string& alias);
+static int aliasQuality(const std::string& alias, float confidence = 0.0f);
 static void initializeSlotAliases(ExpressionContext& context);
 static std::string slotAliasFor(ExpressionContext& context, int slot);
 static std::string normalizeStructuredAlias(ExpressionContext& context, int slot, std::string alias);
@@ -335,6 +545,24 @@ static std::string buildConditionOperand(ExpressionContext& context, const SSAIn
             return buildCallExpression(context, *def, 0);
         }
     }
+    if (useIndex < terminator.uses.size()) {
+        int valueId = terminator.uses[useIndex];
+        if (valueId >= 0 && valueId < (int)context.analyzed.values.size()) {
+            const auto& value = context.analyzed.values[valueId];
+            int logicalSlot = value.slot;
+            if (auto it = context.analyzed.cellSlotToEscapedSlot.find(logicalSlot);
+                it != context.analyzed.cellSlotToEscapedSlot.end()) {
+                logicalSlot = it->second;
+            }
+            if (logicalSlot >= 0 && context.analyzed.escapedMutableSlots.count(logicalSlot) != 0) {
+                std::string slotAlias = sanitizeLuaIdentifier(slotAliasFor(context, logicalSlot), "v");
+                if (!slotAlias.empty() && slotAlias != "_") {
+                    return slotAlias;
+                }
+                return normalizeStructuredAlias(context, logicalSlot, value.name);
+            }
+        }
+    }
     return useIndex < terminator.uses.size() ? buildExpression(context, terminator.uses[useIndex]) : "_";
 }
 
@@ -345,6 +573,87 @@ static std::optional<int> choosePhiRepresentative(ExpressionContext& context, co
 
     if (phi.inputs.empty()) {
         return std::nullopt;
+    }
+
+    // Merged-state cleanup: collapse phi when all incoming values are semantically the same.
+    // This reduces join-state temp junk like boards_1 / v41.key in non-loop merges.
+    int canonicalInput = -1;
+    bool sameInput = true;
+    for (const auto& [pred, inputValueId] : phi.inputs) {
+        (void)pred;
+        if (inputValueId == phi.resultValueId || inputValueId < 0 ||
+            inputValueId >= (int)context.analyzed.values.size()) {
+            continue;
+        }
+        if (canonicalInput < 0) {
+            canonicalInput = inputValueId;
+            continue;
+        }
+        if (canonicalInput != inputValueId) {
+            sameInput = false;
+            break;
+        }
+    }
+    if (sameInput && canonicalInput >= 0) {
+        return canonicalInput;
+    }
+
+    std::optional<std::string> canonicalConstant;
+    bool sameConstant = true;
+    int constantRepresentative = -1;
+    for (const auto& [pred, inputValueId] : phi.inputs) {
+        (void)pred;
+        if (inputValueId == phi.resultValueId || inputValueId < 0 ||
+            inputValueId >= (int)context.analyzed.values.size()) {
+            continue;
+        }
+        const auto& inputValue = context.analyzed.values[inputValueId];
+        if (!inputValue.constantValue.has_value()) {
+            sameConstant = false;
+            break;
+        }
+        if (!canonicalConstant.has_value()) {
+            canonicalConstant = *inputValue.constantValue;
+            constantRepresentative = inputValueId;
+            continue;
+        }
+        if (*canonicalConstant != *inputValue.constantValue) {
+            sameConstant = false;
+            break;
+        }
+    }
+    if (sameConstant && constantRepresentative >= 0) {
+        return constantRepresentative;
+    }
+
+    int aliasRepresentative = -1;
+    std::string canonicalAlias;
+    int canonicalSlot = std::numeric_limits<int>::min();
+    bool sameAlias = true;
+    for (const auto& [pred, inputValueId] : phi.inputs) {
+        (void)pred;
+        if (inputValueId == phi.resultValueId || inputValueId < 0 ||
+            inputValueId >= (int)context.analyzed.values.size()) {
+            continue;
+        }
+
+        const auto& inputValue = context.analyzed.values[inputValueId];
+        std::string alias = assignmentTargetForValue(context, inputValueId);
+        if (aliasRepresentative < 0) {
+            aliasRepresentative = inputValueId;
+            canonicalAlias = alias;
+            canonicalSlot = inputValue.slot;
+            continue;
+        }
+
+        if (alias != canonicalAlias &&
+            (inputValue.slot < 0 || canonicalSlot < 0 || inputValue.slot != canonicalSlot)) {
+            sameAlias = false;
+            break;
+        }
+    }
+    if (sameAlias && aliasRepresentative >= 0) {
+        return aliasRepresentative;
     }
 
     std::vector<int> loopBackPreds;
@@ -424,7 +733,7 @@ static std::string renderTableLiteral(ExpressionContext& context, const TableCon
                 if (isIdentifierKey(*entry.namedKey)) {
                     out << *entry.namedKey << " = ";
                 } else {
-                    out << "[\"" << *entry.namedKey << "\"] = ";
+                    out << "[" << escapeLuaStringLiteral(*entry.namedKey) << "] = ";
                 }
             } else if (entry.numericKey.has_value()) {
                 out << "[" << *entry.numericKey << "] = ";
@@ -467,7 +776,11 @@ static std::string buildCallExpression(ExpressionContext& context, const SSAInst
     }
 
     std::ostringstream out;
-    out << (instruction.uses.empty() ? "_" : buildExpression(context, instruction.uses[0], depth)) << "(";
+    std::string calleeExpr = instruction.uses.empty() ? "_" : buildExpression(context, instruction.uses[0], depth);
+    if (needsCallCalleeParens(calleeExpr)) {
+        calleeExpr = "(" + calleeExpr + ")";
+    }
+    out << calleeExpr << "(";
     for (size_t i = 1; i < instruction.uses.size(); ++i) {
         if (i > 1) {
             out << ", ";
@@ -481,6 +794,24 @@ static std::string buildCallExpression(ExpressionContext& context, const SSAInst
 static std::vector<std::string> collectClosureCaptureAliases(ExpressionContext& context, const SSAInstruction& closureInstruction, const Function& childFunction) {
     std::vector<std::string> aliases;
     aliases.reserve(childFunction.numUpvalues);
+
+    auto aliasNeedsUpgrade = [](const std::string& value) {
+        if (value.empty() || value == "_") {
+            return true;
+        }
+        if (value.rfind("upval", 0) == 0 || value.rfind("capture", 0) == 0) {
+            return true;
+        }
+        if (value.size() > 1 && value[0] == 'v' && std::isdigit((unsigned char)value[1])) {
+            for (size_t i = 2; i < value.size(); ++i) {
+                if (!std::isdigit((unsigned char)value[i]) && value[i] != '_') {
+                    return false;
+                }
+            }
+            return true;
+        }
+        return false;
+    };
 
     int capturePc = closureInstruction.inst.pc + closureInstruction.inst.width;
     int closureInstIndex = closureInstruction.index;
@@ -499,13 +830,19 @@ static std::vector<std::string> collectClosureCaptureAliases(ExpressionContext& 
         switch (captureType) {
             case 0:
             case 1: {
+                bool preserveExactSlotAlias =
+                    (captureType == 1 && context.analyzed.escapedMutableSlots.count(source) != 0);
                 int currentValueId = currentValueForSlotAtInstruction(context.analyzed, closureInstIndex, source);
-                if (currentValueId >= 0 && currentValueId < (int)context.analyzed.values.size()) {
-                    alias = normalizeInheritedAlias(
-                        normalizeStructuredAlias(context, source, context.analyzed.values[currentValueId].name)
-                    );
+                if (preserveExactSlotAlias) {
+                    (void)currentValueId;
+                    alias = sanitizeLuaIdentifier(slotAliasFor(context, source), "v");
+                } else if (currentValueId >= 0 && currentValueId < (int)context.analyzed.values.size()) {
+                    std::string candidate =
+                        normalizeStructuredAlias(context, source, context.analyzed.values[currentValueId].name);
+                    alias = normalizeInheritedAlias(candidate);
                 } else {
-                    alias = normalizeInheritedAlias(slotAliasFor(context, source));
+                    std::string candidate = slotAliasFor(context, source);
+                    alias = normalizeInheritedAlias(candidate);
                 }
                 break;
             }
@@ -523,7 +860,13 @@ static std::vector<std::string> collectClosureCaptureAliases(ExpressionContext& 
                 break;
         }
 
-        aliases.push_back(alias);
+        if (i >= 0 && i < (int)childFunction.upvalueNames.size() &&
+            !childFunction.upvalueNames[i].empty() &&
+            aliasNeedsUpgrade(alias)) {
+            alias = sanitizeLuaIdentifier(childFunction.upvalueNames[i], "upval");
+        }
+
+        aliases.push_back(normalizeInheritedAlias(alias));
     }
 
     return aliases;
@@ -552,6 +895,46 @@ static std::vector<std::string> resolveClosureCaptureAliases(ExpressionContext& 
         }
         if (aliases[i].empty() || aliasQuality(candidate) > aliasQuality(aliases[i])) {
             aliases[i] = candidate;
+        }
+    }
+
+    int capturePc = closureInstruction.inst.pc + closureInstruction.inst.width;
+    int closureInstIndex = closureInstruction.index;
+    int captureInstIndex = closureInstruction.index + 1;
+    for (size_t i = 0; i < aliases.size() && capturePc < (int)context.sourceFunction.instructions.size(); ++i, ++capturePc) {
+        int captureOp = context.opmap.lookup(context.sourceFunction.instructions[capturePc].opcode());
+        if (captureOp != OP_CAPTURE) {
+            break;
+        }
+
+        const auto& captureInst = context.sourceFunction.instructions[capturePc];
+        int captureType = captureInst.a();
+        int source = captureInst.b();
+        if (captureType != 1 || context.analyzed.escapedMutableSlots.count(source) == 0) {
+            if (captureInstIndex < (int)context.analyzed.instructions.size()) {
+                ++captureInstIndex;
+            }
+            continue;
+        }
+
+        if (captureInstIndex >= 0 && captureInstIndex < (int)context.analyzed.instructions.size()) {
+            const auto& ssaCapture = context.analyzed.instructions[captureInstIndex];
+            if (ssaCapture.inst.stdOp == OP_CAPTURE && !ssaCapture.uses.empty()) {
+                aliases[i] = sanitizeLuaIdentifier(slotAliasFor(context, source), "v");
+                ++captureInstIndex;
+                continue;
+            }
+        }
+
+        int currentValueId = currentValueForSlotAtInstruction(context.analyzed, closureInstIndex, source);
+        if (currentValueId >= 0 && currentValueId < (int)context.analyzed.values.size()) {
+            aliases[i] = sanitizeLuaIdentifier(slotAliasFor(context, source), "v");
+        } else {
+            std::string candidate = slotAliasFor(context, source);
+            aliases[i] = sanitizeLuaIdentifier(candidate, "v");
+        }
+        if (captureInstIndex < (int)context.analyzed.instructions.size()) {
+            ++captureInstIndex;
         }
     }
 
@@ -636,6 +1019,60 @@ static void markClosureCapturedValues(ExpressionContext& context) {
             context.closureCapturedValues.insert(instruction.uses.front());
         }
     }
+}
+
+static bool isDirectClosureCaptureValue(const ExpressionContext& context, int valueId) {
+    if (valueId < 0 || valueId >= (int)context.analyzed.values.size()) {
+        return false;
+    }
+    for (const auto& instruction : context.analyzed.instructions) {
+        if (instruction.inst.stdOp != OP_CAPTURE || instruction.uses.empty()) {
+            continue;
+        }
+        if (instruction.inst.a != 0 && instruction.inst.a != 1) {
+            continue;
+        }
+        if (instruction.uses.front() == valueId) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool hasEarlierDirectClosureCaptureInSameSlot(const ExpressionContext& context, int valueId) {
+    if (valueId < 0 || valueId >= (int)context.analyzed.values.size()) {
+        return false;
+    }
+
+    const auto& value = context.analyzed.values[valueId];
+    if (value.slot < 0 || value.definingInstruction < 0) {
+        return false;
+    }
+
+    for (const auto& instruction : context.analyzed.instructions) {
+        if (instruction.inst.stdOp != OP_CAPTURE || instruction.uses.empty()) {
+            continue;
+        }
+        if (instruction.inst.a != 0 && instruction.inst.a != 1) {
+            continue;
+        }
+
+        int capturedValueId = instruction.uses.front();
+        if (capturedValueId < 0 || capturedValueId >= (int)context.analyzed.values.size() ||
+            capturedValueId == valueId) {
+            continue;
+        }
+
+        const auto& capturedValue = context.analyzed.values[capturedValueId];
+        if (capturedValue.slot != value.slot || capturedValue.definingInstruction < 0) {
+            continue;
+        }
+
+        if (capturedValue.definingInstruction < value.definingInstruction) {
+            return true;
+        }
+    }
+    return false;
 }
 
 static void markSymbolicLoopPhiValues(ExpressionContext& context) {
@@ -861,7 +1298,7 @@ static std::string normalizeUpvalueAliasName(std::string alias) {
     return sanitizeLuaIdentifier(alias, "upval");
 }
 
-static int aliasQuality(const std::string& alias) {
+static int aliasQuality(const std::string& alias, float confidence) {
     if (alias.empty()) {
         return -1000;
     }
@@ -880,6 +1317,7 @@ static int aliasQuality(const std::string& alias) {
         score -= 25;
     }
     score -= (int)alias.size() / 8;
+    score += (int)(std::clamp(confidence, 0.0f, 1.0f) * 45.0f);
     return score;
 }
 
@@ -909,7 +1347,7 @@ static void initializeSlotAliases(ExpressionContext& context) {
             continue;
         }
 
-        int score = aliasQuality(candidate);
+        int score = aliasQuality(candidate, value.nameConfidence);
         auto& choice = bestBySlot[value.slot];
         if (score > choice.bestAnyScore) {
             choice.bestAnyScore = score;
@@ -949,15 +1387,19 @@ static std::string assignmentTargetForValue(ExpressionContext& context, int valu
     }
     const auto& value = context.analyzed.values[valueId];
     if (value.slot >= 0) {
-        return normalizeStructuredAlias(context, value.slot, value.name);
+        std::string alias = normalizeStructuredAlias(context, value.slot, value.name);
+        if (!isLuaIdentifier(alias)) {
+            alias = sanitizeLuaIdentifier(alias, slotAliasFor(context, value.slot));
+        }
+        return alias;
     }
-    return value.name;
+    return sanitizeLuaIdentifier(value.name, "v");
 }
 
 static std::string upvalueAliasFor(ExpressionContext& context, int upvalueIndex) {
     if (upvalueIndex >= 0 && upvalueIndex < (int)context.upvalueAliases.size() &&
         !context.upvalueAliases[upvalueIndex].empty()) {
-        return normalizeUpvalueAliasName(context.upvalueAliases[upvalueIndex]);
+        return sanitizeLuaIdentifier(context.upvalueAliases[upvalueIndex], "upval");
     }
     if (upvalueIndex >= 0 && upvalueIndex < (int)context.sourceFunction.upvalueNames.size() &&
         !context.sourceFunction.upvalueNames[upvalueIndex].empty()) {
@@ -1289,6 +1731,7 @@ static void collectStructuredAliasesRecursiveImpl(const Chunk& chunk, const Func
 
     SSAFunction analyzed = analyzeFunction(chunk, sourceFunction, opmap, upvalueAliases);
     ExpressionContext context{chunk, sourceFunction, opmap, analyzed, upvalueAliases};
+    context.aliasesByFunction = &aliasesByFunction;
     initializeSlotAliases(context);
 
     for (const auto& instruction : context.analyzed.instructions) {
@@ -1297,10 +1740,41 @@ static void collectStructuredAliasesRecursiveImpl(const Chunk& chunk, const Func
             continue;
         }
 
-        std::vector<std::string> captureAliases = collectClosureCaptureAliases(context, instruction, **childFunction);
+        std::vector<std::string> captureAliases = resolveClosureCaptureAliases(context, instruction, **childFunction);
         auto& childAliases = aliasesByFunction[(*childFunction)->id];
         std::vector<std::string> previousAliases = childAliases;
-        mergeAliases(childAliases, captureAliases);
+
+        std::unordered_set<size_t> preserveExactCaptureAliases;
+        int capturePc = instruction.inst.pc + instruction.inst.width;
+        for (size_t upvalueIndex = 0;
+             upvalueIndex < captureAliases.size() && capturePc < (int)context.sourceFunction.instructions.size();
+             ++upvalueIndex, ++capturePc) {
+            int captureOp = context.opmap.lookup(context.sourceFunction.instructions[capturePc].opcode());
+            if (captureOp != OP_CAPTURE) {
+                break;
+            }
+            const auto& captureInst = context.sourceFunction.instructions[capturePc];
+            int captureType = captureInst.a();
+            int source = captureInst.b();
+            if (captureType == 1 && context.analyzed.escapedMutableSlots.count(source) != 0) {
+                preserveExactCaptureAliases.insert(upvalueIndex);
+            }
+        }
+
+        if (childAliases.size() < captureAliases.size()) {
+            childAliases.resize(captureAliases.size());
+        }
+        for (size_t i = 0; i < captureAliases.size(); ++i) {
+            const std::string& candidate = captureAliases[i];
+            if (candidate.empty()) {
+                continue;
+            }
+            if (preserveExactCaptureAliases.count(i) != 0 ||
+                childAliases[i].empty() || aliasQuality(candidate) > aliasQuality(childAliases[i])) {
+                childAliases[i] = candidate;
+            }
+        }
+
         if (childAliases != previousAliases) {
             collectStructuredAliasesRecursiveImpl(chunk, **childFunction, opmap, childAliases, aliasesByFunction, activeFunctions);
         }
@@ -1392,10 +1866,10 @@ static std::string buildExpression(ExpressionContext& context, int valueId, int 
                         if (isIdentifierKey(key)) {
                             result = key;
                         } else {
-                            result = "_G[\"" + key + "\"]";
+                            result = "_G[" + escapeLuaStringLiteral(key) + "]";
                         }
                     } else {
-                        result = "_G[\"__global_" + std::to_string(def->inst.pc) + "\"]";
+                        result = "_G[" + escapeLuaStringLiteral("__global_" + std::to_string(def->inst.pc)) + "]";
                     }
                     break;
                 }
@@ -1408,13 +1882,13 @@ static std::string buildExpression(ExpressionContext& context, int valueId, int 
                     result = useExpr(0);
                     break;
                 case OP_GETTABLEKS:
-                    result = useExpr(0) + "." + def->inst.keyName.value_or("key");
+                    result = formatNamedFieldAccess(useExpr(0), def->inst.keyName.value_or("key"));
                     break;
                 case OP_GETTABLE:
-                    result = useExpr(0) + "[" + useExpr(1) + "]";
+                    result = formatIndexAccess(useExpr(0), useExpr(1));
                     break;
                 case OP_GETTABLEN:
-                    result = useExpr(0) + "[" + std::to_string((int)def->inst.c + 1) + "]";
+                    result = formatIndexAccess(useExpr(0), std::to_string((int)def->inst.c + 1));
                     break;
                 case OP_CONCAT: {
                     std::ostringstream out;
@@ -1644,7 +2118,8 @@ static void prepareTableConstructions(ExpressionContext& context) {
     for (const auto& [valueId, table] : context.tables) {
         bool preserveDefinition =
             context.capturedMutableValues.count(valueId) != 0 ||
-            context.closureCapturedValues.count(valueId) != 0;
+            context.closureCapturedValues.count(valueId) != 0 ||
+            isDirectClosureCaptureValue(context, valueId);
         if (!table.selfReferential && table.inlineable && !preserveDefinition) {
             if (const SSAInstruction* def = definingInstruction(context.analyzed, valueId)) {
                 context.foldedInstructions.insert(def->index);
@@ -1751,6 +2226,163 @@ static bool canReachBlock(const ExpressionContext& context, int startBlock, int 
 static bool canReachBlock(const ExpressionContext& context, int startBlock, int targetBlock, int stopBlock) {
     std::unordered_set<int> seen;
     return canReachBlock(context, startBlock, targetBlock, stopBlock, seen);
+}
+
+static int shortestDistanceToBlock(const ExpressionContext& context, int startBlock, int targetBlock, int stopBlock) {
+    if (startBlock < 0 || targetBlock < 0 || startBlock >= (int)context.analyzed.cfg.blocks.size() ||
+        targetBlock >= (int)context.analyzed.cfg.blocks.size()) {
+        return -1;
+    }
+    if (startBlock == targetBlock) {
+        return 0;
+    }
+
+    std::vector<int> distance(context.analyzed.cfg.blocks.size(), -1);
+    std::vector<int> queue;
+    queue.reserve(context.analyzed.cfg.blocks.size());
+
+    distance[startBlock] = 0;
+    queue.push_back(startBlock);
+
+    for (size_t idx = 0; idx < queue.size(); ++idx) {
+        int blockId = queue[idx];
+        if (blockId == stopBlock) {
+            continue;
+        }
+        if (blockId < 0 || blockId >= (int)context.analyzed.cfg.blocks.size()) {
+            continue;
+        }
+
+        const auto& block = context.analyzed.cfg.blocks[blockId];
+        for (int succ : block.successors) {
+            if (succ < 0 || succ >= (int)context.analyzed.cfg.blocks.size()) {
+                continue;
+            }
+            if (succ == stopBlock) {
+                continue;
+            }
+            if (distance[succ] != -1) {
+                continue;
+            }
+            distance[succ] = distance[blockId] + 1;
+            if (succ == targetBlock) {
+                return distance[succ];
+            }
+            queue.push_back(succ);
+        }
+    }
+
+    return -1;
+}
+
+static bool isValidBlockId(const ExpressionContext& context, int blockId) {
+    return blockId >= 0 && blockId < (int)context.analyzed.blocks.size();
+}
+
+static int nearestCommonPostDominator(const ExpressionContext& context, int firstBlock, int secondBlock) {
+    if (!isValidBlockId(context, firstBlock) || !isValidBlockId(context, secondBlock)) {
+        return -1;
+    }
+
+    std::unordered_set<int> firstChain;
+    int current = firstBlock;
+    while (isValidBlockId(context, current)) {
+        firstChain.insert(current);
+        if (current >= (int)context.analyzed.cfg.immediatePostDominator.size()) {
+            break;
+        }
+        current = context.analyzed.cfg.immediatePostDominator[current];
+    }
+
+    current = secondBlock;
+    while (isValidBlockId(context, current)) {
+        if (firstChain.count(current)) {
+            return current;
+        }
+        if (current >= (int)context.analyzed.cfg.immediatePostDominator.size()) {
+            break;
+        }
+        current = context.analyzed.cfg.immediatePostDominator[current];
+    }
+
+    return -1;
+}
+
+static bool branchCanReachJoin(const ExpressionContext& context, int branchBlock, int joinBlock) {
+    if (!isValidBlockId(context, branchBlock) || !isValidBlockId(context, joinBlock)) {
+        return false;
+    }
+    if (branchBlock == joinBlock) {
+        return true;
+    }
+    return canReachBlock(context, branchBlock, joinBlock, -1);
+}
+
+static int chooseConditionalJoinBlock(const ExpressionContext& context, int currentBlock, int branchTrue,
+                                      int branchFalse, int stopBlock) {
+    auto reachableFromBoth = [&](int candidate) {
+        if (!isValidBlockId(context, candidate) || candidate == currentBlock) {
+            return false;
+        }
+
+        bool trueReach = branchTrue < 0 || branchCanReachJoin(context, branchTrue, candidate);
+        bool falseReach = branchFalse < 0 || branchCanReachJoin(context, branchFalse, candidate);
+        return trueReach && falseReach;
+    };
+
+    int ipdomJoin = (currentBlock >= 0 && currentBlock < (int)context.analyzed.cfg.immediatePostDominator.size())
+        ? context.analyzed.cfg.immediatePostDominator[currentBlock]
+        : -1;
+    if (reachableFromBoth(ipdomJoin)) {
+        return ipdomJoin;
+    }
+
+    int mergedJoin = nearestCommonPostDominator(context, branchTrue, branchFalse);
+    if (reachableFromBoth(mergedJoin)) {
+        return mergedJoin;
+    }
+
+    if (reachableFromBoth(stopBlock)) {
+        return stopBlock;
+    }
+
+    // Structurer v2 fallback: search for nearest reachable merge block.
+    // This improves elseif/while/repeat recovery when immediate post-dominator is under-constrained.
+    int bestJoin = -1;
+    int bestScore = std::numeric_limits<int>::max();
+    const int blockCount = (int)context.analyzed.cfg.blocks.size();
+    for (int candidate = 0; candidate < blockCount; ++candidate) {
+        if (!reachableFromBoth(candidate)) {
+            continue;
+        }
+        if ((candidate == branchTrue || candidate == branchFalse) && candidate != stopBlock) {
+            continue;
+        }
+
+        int dTrue = branchTrue < 0 ? 0 : shortestDistanceToBlock(context, branchTrue, candidate, stopBlock);
+        int dFalse = branchFalse < 0 ? 0 : shortestDistanceToBlock(context, branchFalse, candidate, stopBlock);
+        int dCurrent = shortestDistanceToBlock(context, currentBlock, candidate, stopBlock);
+        if ((branchTrue >= 0 && dTrue < 0) || (branchFalse >= 0 && dFalse < 0)) {
+            continue;
+        }
+        if (dCurrent < 0) {
+            continue;
+        }
+
+        int score = dTrue + dFalse + (2 * dCurrent);
+        if (candidate == ipdomJoin) {
+            score -= 1;
+        }
+        if (score < bestScore || (score == bestScore && (bestJoin < 0 || candidate < bestJoin))) {
+            bestScore = score;
+            bestJoin = candidate;
+        }
+    }
+    if (bestJoin >= 0) {
+        return bestJoin;
+    }
+
+    return ipdomJoin;
 }
 
 static std::vector<int> loopBackPredecessors(const ExpressionContext& context, int headerBlock) {
@@ -1948,7 +2580,8 @@ static std::string renderInstruction(ExpressionContext& context, const SSAInstru
             return false;
         }
         int valueId = instruction.defs.front();
-        return context.closureCapturedValues.count(valueId) != 0;
+        return context.closureCapturedValues.count(valueId) != 0 ||
+            isDirectClosureCaptureValue(context, valueId);
     };
     auto renderCapturedMutableInit = [&]() -> std::string {
         if (instruction.defs.empty()) {
@@ -2033,6 +2666,10 @@ static std::string renderInstruction(ExpressionContext& context, const SSAInstru
             return "";
         }
         bool isInitialDefinition = isInitialClosureCapturedDefinition(context, valueId);
+        if (!isInitialDefinition && isDirectClosureCaptureValue(context, valueId) &&
+            !hasEarlierDirectClosureCaptureInSameSlot(context, valueId)) {
+            isInitialDefinition = true;
+        }
         return (isInitialDefinition ? "local " : "") + target + " = " + rhs;
     };
 
@@ -2101,7 +2738,7 @@ static std::string renderInstruction(ExpressionContext& context, const SSAInstru
 
             auto tableIt = context.tables.find(tableValueId);
             if (tableIt != context.tables.end() && tableIt->second.selfReferential &&
-                key != "__index" && isIdentifierKey(key)) {
+                key != "__index" && isIdentifierKey(key) && isQualifiedIdentifierPath(tableExpr)) {
                 if (auto named = renderNamedClosureDefinition(context, tableExpr + "." + key, sourceValueId, 0);
                     named.has_value()) {
                     return *named;
@@ -2109,18 +2746,18 @@ static std::string renderInstruction(ExpressionContext& context, const SSAInstru
             }
 
             std::string valueExpr = sourceValueId >= 0 ? buildExpression(context, sourceValueId, 0) : "_";
-            return tableExpr + "." + key + " = " + valueExpr;
+            return formatNamedFieldAccess(tableExpr, key) + " = " + valueExpr;
         }
         case OP_SETTABLE: {
             std::string tableExpr = buildSlotExpression(context, instruction, instruction.inst.b);
             std::string keyExpr = buildSlotExpression(context, instruction, instruction.inst.c);
             std::string valueExpr = buildSlotExpression(context, instruction, instruction.inst.a);
-            return tableExpr + "[" + keyExpr + "] = " + valueExpr;
+            return formatIndexAccess(tableExpr, keyExpr) + " = " + valueExpr;
         }
         case OP_SETTABLEN: {
             std::string tableExpr = buildSlotExpression(context, instruction, instruction.inst.b);
             std::string valueExpr = buildSlotExpression(context, instruction, instruction.inst.a);
-            return tableExpr + "[" + std::to_string((int)instruction.inst.c + 1) + "] = " + valueExpr;
+            return formatIndexAccess(tableExpr, std::to_string((int)instruction.inst.c + 1)) + " = " + valueExpr;
         }
         case OP_SETLIST: {
             std::string tableExpr = buildSlotExpression(context, instruction, instruction.inst.a);
@@ -2158,9 +2795,9 @@ static std::string renderInstruction(ExpressionContext& context, const SSAInstru
                 if (isIdentifierKey(key)) {
                     return key + " = " + useExpr(0);
                 }
-                return "_G[\"" + key + "\"] = " + useExpr(0);
+                return "_G[" + escapeLuaStringLiteral(key) + "] = " + useExpr(0);
             }
-            return "_G[\"__global_" + std::to_string(instruction.inst.pc) + "\"] = " + useExpr(0);
+            return "_G[" + escapeLuaStringLiteral("__global_" + std::to_string(instruction.inst.pc)) + "] = " + useExpr(0);
         case OP_ADD:
         case OP_SUB:
         case OP_MUL:
@@ -2227,7 +2864,8 @@ static bool shouldEmitNonTerminator(const SSAInstruction& instruction, const Exp
             return false;
         }
         int valueId = instruction.defs.front();
-        return context.closureCapturedValues.count(valueId) != 0;
+        return context.closureCapturedValues.count(valueId) != 0 ||
+            isDirectClosureCaptureValue(context, valueId);
     };
 
     if ((instruction.inst.stdOp == OP_NEWTABLE || instruction.inst.stdOp == OP_DUPTABLE) && !instruction.defs.empty()) {
@@ -2775,9 +3413,10 @@ static std::vector<AstStatement> buildRegionList(ExpressionContext& context, int
                 ifStmt.kind = AstStatementKind::If;
                 std::string condition = renderCondition(context, terminator);
 
-                int join = (current >= 0 && current < (int)context.analyzed.cfg.immediatePostDominator.size())
-                    ? context.analyzed.cfg.immediatePostDominator[current]
-                    : -1;
+                int join = chooseConditionalJoinBlock(context, current, branchTrue, branchFalse, stopBlock);
+                if (!isValidBlockId(context, join) && isValidBlockId(context, stopBlock)) {
+                    join = stopBlock;
+                }
 
                 int thenBlock = branchFalse;
                 int elseBlock = branchTrue;
@@ -2801,12 +3440,12 @@ static std::vector<AstStatement> buildRegionList(ExpressionContext& context, int
                 }
 
                 if (ifStmt.body.empty() && ifStmt.elseBody.empty()) {
-                    current = join;
+                    current = isValidBlockId(context, join) ? join : stopBlock;
                     continue;
                 }
 
                 block.body.push_back(ifStmt);
-                current = join;
+                current = isValidBlockId(context, join) ? join : stopBlock;
                 continue;
             }
 
@@ -2842,49 +3481,56 @@ static std::vector<AstStatement> buildRegionList(ExpressionContext& context, int
 
     return block.body;
 }
+} // namespace
+
+namespace {
+struct StructuringQuality {
+    float confidence = 1.0f;
+    int placeholderCount = 0;
+    int emptyIfCount = 0;
+    int whileTrueCount = 0;
+    bool recommendFallback = false;
+};
+
+static std::atomic<int> g_structuredFunctionsProcessed{0};
+static std::atomic<int> g_structuredFunctionsFallback{0};
+
+static bool isIdentifierChar(unsigned char ch) {
+    return std::isalnum(ch) != 0 || ch == '_';
 }
 
-AstFunction structureFunction(const Chunk& chunk, const Function& sourceFunction, const OpcodeMap& opmap,
-                              const std::vector<std::string>& upvalueAliases) {
-    SSAFunction analyzed = analyzeFunction(chunk, sourceFunction, opmap, upvalueAliases);
-    ExpressionContext context{chunk, sourceFunction, opmap, analyzed, upvalueAliases};
-    initializeSlotAliases(context);
-    populatePhiMap(context);
-    markSymbolicLoopPhiValues(context);
-    markSymbolicConditionalPhiValues(context);
-    markCapturedMutableSlots(context);
-    markClosureCapturedValues(context);
-    prepareTableConstructions(context);
-
-    AstFunction function;
-    function.name = isUsableFunctionName(sourceFunction.debugName)
-        ? sourceFunction.debugName
-        : ("proto_" + std::to_string(sourceFunction.id));
-    for (int slot = 0; slot < sourceFunction.numParams; ++slot) {
-        function.params.push_back(localNameForSlot(sourceFunction, slot));
+static int countExactToken(const std::string& text, const std::string& token) {
+    if (token.empty() || text.empty()) {
+        return 0;
     }
-        function.body.kind = AstStatementKind::Block;
-    if (!context.analyzed.blocks.empty() && !context.analyzed.cfg.blocks.empty()) {
-        std::unordered_set<int> visited;
-        function.body.body = buildRegionList(context, 0, -1, visited);
+    int count = 0;
+    size_t pos = 0;
+    while ((pos = text.find(token, pos)) != std::string::npos) {
+        bool leftBoundary = pos == 0 || !isIdentifierChar((unsigned char)text[pos - 1]);
+        bool rightBoundary = (pos + token.size() >= text.size()) ||
+            !isIdentifierChar((unsigned char)text[pos + token.size()]);
+        if (leftBoundary && rightBoundary) {
+            ++count;
+        }
+        pos += token.size();
     }
-    return function;
+    return count;
 }
 
-static AstFunction structureFunctionWithAliases(const Chunk& chunk, const Function& sourceFunction, const OpcodeMap& opmap,
-                                                const std::vector<std::string>& upvalueAliases,
-                                                const std::unordered_map<int, std::vector<std::string>>& aliasesByFunction) {
-    SSAFunction analyzed = analyzeFunction(chunk, sourceFunction, opmap, upvalueAliases);
-    ExpressionContext context{chunk, sourceFunction, opmap, analyzed, upvalueAliases};
-    context.aliasesByFunction = &aliasesByFunction;
-    initializeSlotAliases(context);
-    populatePhiMap(context);
-    markSymbolicLoopPhiValues(context);
-    markSymbolicConditionalPhiValues(context);
-    markCapturedMutableSlots(context);
-    markClosureCapturedValues(context);
-    prepareTableConstructions(context);
+static int countSubstring(const std::string& text, const std::string& needle) {
+    if (needle.empty() || text.empty()) {
+        return 0;
+    }
+    int count = 0;
+    size_t pos = 0;
+    while ((pos = text.find(needle, pos)) != std::string::npos) {
+        ++count;
+        pos += needle.size();
+    }
+    return count;
+}
 
+static AstFunction makeFunctionShell(const Function& sourceFunction) {
     AstFunction function;
     function.name = isUsableFunctionName(sourceFunction.debugName)
         ? sourceFunction.debugName
@@ -2893,11 +3539,195 @@ static AstFunction structureFunctionWithAliases(const Chunk& chunk, const Functi
         function.params.push_back(localNameForSlot(sourceFunction, slot));
     }
     function.body.kind = AstStatementKind::Block;
+    return function;
+}
+
+static std::vector<AstStatement> collectMissingDirectCaptureInitializers(
+    ExpressionContext& context, const std::vector<AstStatement>& existingStatements
+) {
+    (void)existingStatements;
+
+    std::unordered_set<int> emittedSlots;
+    std::vector<AstStatement> initializers;
+
+    for (const auto& instruction : context.analyzed.instructions) {
+        if (instruction.inst.stdOp != OP_CAPTURE || instruction.inst.a != 1 || instruction.uses.empty()) {
+            continue;
+        }
+
+        int capturedValueId = instruction.uses.front();
+        if (capturedValueId < 0 || capturedValueId >= (int)context.analyzed.values.size()) {
+            continue;
+        }
+
+        const auto& capturedValue = context.analyzed.values[capturedValueId];
+        if (capturedValue.slot < 0 || !emittedSlots.insert(capturedValue.slot).second) {
+            continue;
+        }
+        if (!capturedValue.constantValue.has_value()) {
+            continue;
+        }
+
+        std::string target = sanitizeLuaIdentifier(slotAliasFor(context, capturedValue.slot), "v");
+        if (!isLuaIdentifier(target)) {
+            continue;
+        }
+
+        std::string rhs = normalizeLiteral(*capturedValue.constantValue);
+        if (rhs.empty() || rhs == target) {
+            continue;
+        }
+
+        AstStatement raw;
+        raw.kind = AstStatementKind::Raw;
+        raw.text = "local " + target + " = " + rhs;
+        initializers.push_back(std::move(raw));
+    }
+
+    return initializers;
+}
+
+static StructuringQuality evaluateStructuredQuality(const AstFunction& function, const SSAFunction& analyzed) {
+    StructuringQuality quality;
+    std::string rendered = formatAstFunction(function);
+
+    quality.placeholderCount =
+        countExactToken(rendered, "condition") +
+        countExactToken(rendered, "_");
+    quality.emptyIfCount = countSubstring(rendered, "then\nend") + countSubstring(rendered, "then\r\nend");
+    quality.whileTrueCount = countExactToken(rendered, "while true do");
+
+    if (rendered.empty()) {
+        quality.confidence -= 0.7f;
+    }
+    if (!analyzed.instructions.empty() && function.body.body.empty()) {
+        quality.confidence -= 0.55f;
+    }
+    quality.confidence -= std::min(0.45f, quality.placeholderCount * 0.03f);
+    quality.confidence -= std::min(0.25f, quality.emptyIfCount * 0.08f);
+    quality.confidence -= std::min(0.15f, quality.whileTrueCount * 0.03f);
+    if (quality.confidence < 0.0f) {
+        quality.confidence = 0.0f;
+    }
+
+    const bool sufficientlyComplex = analyzed.instructions.size() >= 12;
+    quality.recommendFallback =
+        ((!analyzed.instructions.empty() && function.body.body.empty()) ||
+         (sufficientlyComplex &&
+          (quality.confidence < 0.56f ||
+           quality.placeholderCount >= 10 ||
+           (quality.placeholderCount >= 6 && quality.emptyIfCount > 0))));
+    return quality;
+}
+
+static AstFunction buildStructuredFunctionFromContext(ExpressionContext& context) {
+    AstFunction function = makeFunctionShell(context.sourceFunction);
     if (!context.analyzed.blocks.empty() && !context.analyzed.cfg.blocks.empty()) {
         std::unordered_set<int> visited;
         function.body.body = buildRegionList(context, 0, -1, visited);
+        std::vector<AstStatement> captureInitializers =
+            collectMissingDirectCaptureInitializers(context, function.body.body);
+        if (!captureInitializers.empty()) {
+            std::vector<AstStatement> merged;
+            merged.reserve(captureInitializers.size() + function.body.body.size());
+            for (auto& initializer : captureInitializers) {
+                merged.push_back(std::move(initializer));
+            }
+            for (auto& statement : function.body.body) {
+                merged.push_back(std::move(statement));
+            }
+            function.body.body = std::move(merged);
+        }
     }
     return function;
+}
+
+static AstFunction fallbackFunctionToLegacyBody(const Chunk& chunk, const Function& sourceFunction, const OpcodeMap& opmap,
+                                                const StructuringQuality& quality,
+                                                const std::string* reason = nullptr) {
+    AstFunction fallback = makeFunctionShell(sourceFunction);
+
+    AstStatement note;
+    note.kind = AstStatementKind::Raw;
+    note.text =
+        "-- Structured fallback: legacy body emitter\n"
+        "-- confidence=" + std::to_string(quality.confidence) +
+        " placeholders=" + std::to_string(quality.placeholderCount);
+    if (reason && !reason->empty()) {
+        note.text += "\n-- reason=" + *reason;
+    }
+    fallback.body.body.push_back(std::move(note));
+
+    AstStatement body;
+    body.kind = AstStatementKind::Raw;
+    std::string legacyBody = trimSpace(generateFunctionBodyCode(chunk, opmap, sourceFunction));
+    if (legacyBody.empty()) {
+        legacyBody = "legacy fallback body unavailable";
+    }
+    std::ostringstream commented;
+    commented << "-- legacy fallback body (commented for parse safety)\n";
+    std::istringstream lines(legacyBody);
+    std::string line;
+    while (std::getline(lines, line)) {
+        commented << "-- " << line << "\n";
+    }
+    commented << "-- end legacy fallback body";
+    body.text = commented.str();
+    fallback.body.body.push_back(std::move(body));
+    return fallback;
+}
+
+static AstFunction structureFunctionWithPolicy(const Chunk& chunk, const Function& sourceFunction, const OpcodeMap& opmap,
+                                               const std::vector<std::string>& upvalueAliases,
+                                               const std::unordered_map<int, std::vector<std::string>>* aliasesByFunction) {
+    try {
+        SSAFunction analyzed = analyzeFunction(chunk, sourceFunction, opmap, upvalueAliases);
+        ExpressionContext context{chunk, sourceFunction, opmap, analyzed, upvalueAliases};
+        context.aliasesByFunction = aliasesByFunction;
+        initializeSlotAliases(context);
+        populatePhiMap(context);
+        markSymbolicLoopPhiValues(context);
+        markSymbolicConditionalPhiValues(context);
+        markCapturedMutableSlots(context);
+        markClosureCapturedValues(context);
+        prepareTableConstructions(context);
+
+        AstFunction function = buildStructuredFunctionFromContext(context);
+        StructuringQuality quality = evaluateStructuredQuality(function, analyzed);
+        g_structuredFunctionsProcessed.fetch_add(1, std::memory_order_relaxed);
+        if (quality.recommendFallback) {
+            g_structuredFunctionsFallback.fetch_add(1, std::memory_order_relaxed);
+            fprintf(stderr,
+                    "[*] Structured fallback for proto#%d (confidence=%.2f placeholders=%d)\n",
+                    sourceFunction.id, quality.confidence, quality.placeholderCount);
+            return fallbackFunctionToLegacyBody(chunk, sourceFunction, opmap, quality);
+        }
+        return function;
+    } catch (const std::exception& ex) {
+        g_structuredFunctionsProcessed.fetch_add(1, std::memory_order_relaxed);
+        g_structuredFunctionsFallback.fetch_add(1, std::memory_order_relaxed);
+        fprintf(stderr, "[*] Structured fallback for proto#%d due to exception: %s\n",
+                sourceFunction.id, ex.what());
+
+        StructuringQuality degraded;
+        degraded.confidence = 0.0f;
+        degraded.placeholderCount = 9999;
+        degraded.recommendFallback = true;
+        std::string reason = std::string("exception: ") + ex.what();
+        return fallbackFunctionToLegacyBody(chunk, sourceFunction, opmap, degraded, &reason);
+    }
+}
+
+static AstFunction structureFunctionWithAliases(const Chunk& chunk, const Function& sourceFunction, const OpcodeMap& opmap,
+                                                const std::vector<std::string>& upvalueAliases,
+                                                const std::unordered_map<int, std::vector<std::string>>& aliasesByFunction) {
+    return structureFunctionWithPolicy(chunk, sourceFunction, opmap, upvalueAliases, &aliasesByFunction);
+}
+} // namespace
+
+AstFunction structureFunction(const Chunk& chunk, const Function& sourceFunction, const OpcodeMap& opmap,
+                              const std::vector<std::string>& upvalueAliases) {
+    return structureFunctionWithPolicy(chunk, sourceFunction, opmap, upvalueAliases, nullptr);
 }
 
 AstFunction structureMainFunction(const Chunk& chunk, const OpcodeMap& opmap) {
@@ -2911,13 +3741,26 @@ AstFunction structureMainFunction(const Chunk& chunk, const OpcodeMap& opmap) {
 }
 
 std::string formatStructuredSource(const Chunk& chunk, const OpcodeMap& opmap) {
+    g_structuredFunctionsProcessed.store(0, std::memory_order_relaxed);
+    g_structuredFunctionsFallback.store(0, std::memory_order_relaxed);
+
     std::ostringstream out;
     out << "-- ============================================\n";
     out << "-- Luau Decompiled Output\n";
     out << "-- Bytecode v" << (int)chunk.version << " | Types v" << (int)chunk.typesVersion << "\n";
     out << "-- " << chunk.strings.size() << " strings, " << chunk.functions.size() << " functions\n";
+    int typedFunctions = 0;
+    int typeBlobBytes = 0;
+    for (const auto& function : chunk.functions) {
+        if (function.hasTypeInfo) {
+            typedFunctions++;
+            typeBlobBytes += function.typeInfoSize;
+        }
+    }
+    out << "-- Type info: " << typedFunctions << " typed functions, " << typeBlobBytes << " bytes\n";
     out << "-- Main entry: proto#" << chunk.mainIndex << "\n";
     out << "-- Opcodes mapped: " << opmap.totalMapped << "/" << OP_COUNT << "\n";
+    out << "-- Structurer fallback policy: per-function confidence gate\n";
     out << "-- ============================================\n\n";
     out << "-- Backend: structured-ast\n\n";
 
@@ -2926,10 +3769,17 @@ std::string formatStructuredSource(const Chunk& chunk, const OpcodeMap& opmap) {
     if (!body.empty() && body.back() != '\n') {
         out << "\n";
     }
+    out << "\n-- Structured functions processed: "
+        << g_structuredFunctionsProcessed.load(std::memory_order_relaxed) << "\n";
+    out << "-- Structured fallbacks used: "
+        << g_structuredFunctionsFallback.load(std::memory_order_relaxed) << "\n";
     return out.str();
 }
 
 std::string formatStructuredAst(const Chunk& chunk, const OpcodeMap& opmap) {
+    g_structuredFunctionsProcessed.store(0, std::memory_order_relaxed);
+    g_structuredFunctionsFallback.store(0, std::memory_order_relaxed);
+
     std::ostringstream out;
     out << "-- Structured AST Dump\n";
     out << "-- Functions: " << chunk.functions.size() << "\n\n";
@@ -2939,7 +3789,7 @@ std::string formatStructuredAst(const Chunk& chunk, const OpcodeMap& opmap) {
         collectStructuredAliasesRecursive(chunk, chunk.functions[chunk.mainIndex], opmap, {}, aliasesByFunction);
     }
 
-    for (const auto& function : chunk.functions) {
+    auto chunks = formatFunctionsParallel(chunk.functions, [&](const Function& function) {
         auto aliasIt = aliasesByFunction.find(function.id);
         AstFunction ast = structureFunctionWithAliases(
             chunk,
@@ -2948,8 +3798,17 @@ std::string formatStructuredAst(const Chunk& chunk, const OpcodeMap& opmap) {
             aliasIt != aliasesByFunction.end() ? aliasIt->second : std::vector<std::string>{},
             aliasesByFunction
         );
-        out << formatAstFunction(ast) << "\n";
+        return formatAstFunction(ast) + "\n";
+    });
+
+    for (const auto& chunkText : chunks) {
+        out << chunkText;
     }
+
+    out << "-- Structured functions processed: "
+        << g_structuredFunctionsProcessed.load(std::memory_order_relaxed) << "\n";
+    out << "-- Structured fallbacks used: "
+        << g_structuredFunctionsFallback.load(std::memory_order_relaxed) << "\n";
 
     return out.str();
 }

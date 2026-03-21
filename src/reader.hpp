@@ -4,7 +4,7 @@
 #include <vector>
 #include <stdexcept>
 
-
+// BytecodeReader: reads Luau bytecode binary format
 class BytecodeReader {
 public:
     BytecodeReader(const uint8_t* data, size_t size);
@@ -15,7 +15,7 @@ public:
     uint32_t readUInt32();
     float    readFloat();
     double   readDouble();
-    int32_t  readVarInt();       
+    int32_t  readVarInt();       // compressed int encoding
     std::string readString(int len);
 
     size_t   position() const { return pos_; }

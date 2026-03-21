@@ -22,6 +22,7 @@ struct SSAVariable {
     int upvalueIndex = -1;
     int useCount = 0;
     std::string name;
+    float nameConfidence = 0.0f;
     std::optional<std::string> constantValue;
 };
 

@@ -1,6 +1,9 @@
 #include "cfg.hpp"
 #include <algorithm>
+#include <atomic>
+#include <future>
 #include <sstream>
+#include <thread>
 #include <unordered_set>
 
 static bool isConditionalJump(int op) {
@@ -172,6 +175,46 @@ static std::vector<int> computeImmediateDominators(const ControlFlowGraph& cfg, 
     return idom;
 }
 
+template <typename Formatter>
+static std::vector<std::string> formatFunctionsParallel(const std::vector<Function>& functions, Formatter&& formatter) {
+    const size_t functionCount = functions.size();
+    std::vector<std::string> chunks(functionCount);
+    if (functionCount == 0) {
+        return chunks;
+    }
+
+    unsigned int workerCount = std::thread::hardware_concurrency();
+    if (workerCount == 0) {
+        workerCount = 4;
+    }
+    workerCount = (unsigned int)std::min<size_t>(workerCount, functionCount);
+    if (workerCount <= 1 || functionCount < 4) {
+        for (size_t i = 0; i < functionCount; ++i) {
+            chunks[i] = formatter(functions[i]);
+        }
+        return chunks;
+    }
+
+    std::atomic<size_t> nextIndex{0};
+    std::vector<std::future<void>> workers;
+    workers.reserve(workerCount);
+    for (unsigned int worker = 0; worker < workerCount; ++worker) {
+        workers.push_back(std::async(std::launch::async, [&]() {
+            while (true) {
+                size_t index = nextIndex.fetch_add(1);
+                if (index >= functionCount) {
+                    break;
+                }
+                chunks[index] = formatter(functions[index]);
+            }
+        }));
+    }
+    for (auto& worker : workers) {
+        worker.get();
+    }
+    return chunks;
+}
+
 ControlFlowGraph buildControlFlowGraph(const Function& function, const OpcodeMap& opmap) {
     ControlFlowGraph cfg;
     const int numInst = (int)function.instructions.size();
@@ -314,18 +357,19 @@ std::string formatControlFlowGraph(const Chunk& chunk, const OpcodeMap& opmap) {
     out << "-- Control Flow Graph Dump\n";
     out << "-- Functions: " << chunk.functions.size() << "\n\n";
 
-    for (const auto& function : chunk.functions) {
+    auto chunks = formatFunctionsParallel(chunk.functions, [&](const Function& function) {
+        std::ostringstream fnOut;
         ControlFlowGraph cfg = buildControlFlowGraph(function, opmap);
         FunctionIR ir = decodeFunctionIR(function, opmap);
 
-        out << "Function proto#" << function.id;
+        fnOut << "Function proto#" << function.id;
         if (!function.debugName.empty()) {
-            out << " \"" << function.debugName << "\"";
+            fnOut << " \"" << function.debugName << "\"";
         }
         if (function.lineDefined > 0) {
-            out << " line " << function.lineDefined;
+            fnOut << " line " << function.lineDefined;
         }
-        out << "\n";
+        fnOut << "\n";
 
         for (const auto& block : cfg.blocks) {
             const int lastIndex = (block.endPc >= 0 && block.endPc < (int)cfg.rawPcToInstruction.size())
@@ -335,59 +379,64 @@ std::string formatControlFlowGraph(const Chunk& chunk, const OpcodeMap& opmap) {
                 ? ir[lastIndex].opName.c_str()
                 : "OTHER";
 
-            out << "  block b" << block.id
-                << " [" << block.startPc << ", " << block.endPc << "]"
-                << " last=" << lastOp;
+            fnOut << "  block b" << block.id
+                  << " [" << block.startPc << ", " << block.endPc << "]"
+                  << " last=" << lastOp;
 
             if (cfg.immediateDominator.size() == cfg.blocks.size()) {
-                out << " idom=";
-                if (cfg.immediateDominator[block.id] >= 0) out << "b" << cfg.immediateDominator[block.id];
-                else out << "entry";
+                fnOut << " idom=";
+                if (cfg.immediateDominator[block.id] >= 0) fnOut << "b" << cfg.immediateDominator[block.id];
+                else fnOut << "entry";
             }
             if (cfg.immediatePostDominator.size() == cfg.blocks.size()) {
-                out << " ipdom=";
-                if (cfg.immediatePostDominator[block.id] >= 0) out << "b" << cfg.immediatePostDominator[block.id];
-                else out << "exit";
+                fnOut << " ipdom=";
+                if (cfg.immediatePostDominator[block.id] >= 0) fnOut << "b" << cfg.immediatePostDominator[block.id];
+                else fnOut << "exit";
             }
-            out << "\n";
+            fnOut << "\n";
 
             if (!block.predecessors.empty()) {
-                out << "    preds:";
+                fnOut << "    preds:";
                 for (int pred : block.predecessors) {
-                    out << " b" << pred;
+                    fnOut << " b" << pred;
                 }
-                out << "\n";
+                fnOut << "\n";
             }
 
             if (!block.successors.empty()) {
-                out << "    succs:";
+                fnOut << "    succs:";
                 for (int succ : block.successors) {
-                    out << " b" << succ;
+                    fnOut << " b" << succ;
                 }
-                out << "\n";
+                fnOut << "\n";
             }
         }
 
         if (!cfg.edges.empty()) {
-            out << "  edges:\n";
+            fnOut << "  edges:\n";
             for (const auto& edge : cfg.edges) {
-                out << "    b" << edge.fromBlock << " -> b" << edge.toBlock
-                    << " @pc " << edge.sourcePc
-                    << " (" << edgeKindName(edge.kind) << ")\n";
+                fnOut << "    b" << edge.fromBlock << " -> b" << edge.toBlock
+                      << " @pc " << edge.sourcePc
+                      << " (" << edgeKindName(edge.kind) << ")\n";
             }
         }
 
         if (!cfg.elseByJumpPc.empty()) {
-            out << "  else_transitions:\n";
+            fnOut << "  else_transitions:\n";
             for (const auto& [jumpPc, transition] : cfg.elseByJumpPc) {
-                out << "    cond_pc=" << transition.conditionPc
-                    << " jump_pc=" << jumpPc
-                    << " else_start=" << transition.elseStartPc
-                    << " else_end=" << transition.elseEndPc << "\n";
+                fnOut << "    cond_pc=" << transition.conditionPc
+                      << " jump_pc=" << jumpPc
+                      << " else_start=" << transition.elseStartPc
+                      << " else_end=" << transition.elseEndPc << "\n";
             }
         }
 
-        out << "\n";
+        fnOut << "\n";
+        return fnOut.str();
+    });
+
+    for (const auto& chunkText : chunks) {
+        out << chunkText;
     }
 
     return out.str();

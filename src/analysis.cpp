@@ -1,10 +1,15 @@
 #include "analysis.hpp"
 #include "identifier_utils.hpp"
 #include <algorithm>
+#include <atomic>
 #include <cctype>
 #include <cmath>
+#include <future>
+#include <iomanip>
 #include <sstream>
+#include <thread>
 #include <unordered_map>
+#include <unordered_set>
 
 namespace {
 static std::string toIdentifier(std::string value) {
@@ -37,6 +42,34 @@ static std::optional<double> parseNumericLiteral(const std::string& value) {
     } catch (...) {
     }
     return std::nullopt;
+}
+
+static std::optional<std::string> constantForKInstruction(const Function& sourceFunction, const SSAInstruction& instruction) {
+    int constantIndex = -1;
+    switch (instruction.inst.stdOp) {
+        case OP_ADDK:
+        case OP_SUBK:
+        case OP_MULK:
+        case OP_DIVK:
+        case OP_MODK:
+        case OP_POWK:
+        case OP_IDIVK:
+        case OP_ANDK:
+        case OP_ORK:
+            constantIndex = instruction.inst.c;
+            break;
+        case OP_SUBRK:
+        case OP_DIVRK:
+            constantIndex = instruction.inst.b;
+            break;
+        default:
+            return std::nullopt;
+    }
+
+    if (constantIndex < 0 || constantIndex >= (int)sourceFunction.constants.size()) {
+        return std::nullopt;
+    }
+    return sourceFunction.constants[constantIndex].toString({});
 }
 
 static std::optional<std::string> asQuotedString(const std::string& value) {
@@ -166,6 +199,127 @@ static void recomputeUseCounts(SSAFunction& function) {
     }
 }
 
+template <typename Formatter>
+static std::vector<std::string> formatFunctionsParallel(const std::vector<Function>& functions, Formatter&& formatter) {
+    const size_t functionCount = functions.size();
+    std::vector<std::string> chunks(functionCount);
+    if (functionCount == 0) {
+        return chunks;
+    }
+
+    unsigned int workerCount = std::thread::hardware_concurrency();
+    if (workerCount == 0) {
+        workerCount = 4;
+    }
+    workerCount = (unsigned int)std::min<size_t>(workerCount, functionCount);
+    if (workerCount <= 1 || functionCount < 4) {
+        for (size_t i = 0; i < functionCount; ++i) {
+            chunks[i] = formatter(functions[i]);
+        }
+        return chunks;
+    }
+
+    std::atomic<size_t> nextIndex{0};
+    std::vector<std::future<void>> workers;
+    workers.reserve(workerCount);
+    for (unsigned int worker = 0; worker < workerCount; ++worker) {
+        workers.push_back(std::async(std::launch::async, [&]() {
+            while (true) {
+                size_t index = nextIndex.fetch_add(1);
+                if (index >= functionCount) {
+                    break;
+                }
+                chunks[index] = formatter(functions[index]);
+            }
+        }));
+    }
+    for (auto& worker : workers) {
+        worker.get();
+    }
+    return chunks;
+}
+
+static bool applyValueReplacements(SSAFunction& function, std::vector<int>& replacements) {
+    if (replacements.empty()) {
+        return false;
+    }
+
+    bool changed = false;
+    for (int valueId = 0; valueId < (int)replacements.size(); ++valueId) {
+        if (replacements[valueId] < 0) {
+            continue;
+        }
+        replacements[valueId] = resolveAliasValue(replacements, replacements[valueId]);
+        if (replacements[valueId] >= 0 && replacements[valueId] != valueId) {
+            changed = true;
+        } else {
+            replacements[valueId] = -1;
+        }
+    }
+
+    if (!changed) {
+        return false;
+    }
+
+    for (auto& block : function.blocks) {
+        for (auto& phi : block.phis) {
+            if (phi.dead) {
+                continue;
+            }
+            for (auto& [pred, inputValueId] : phi.inputs) {
+                (void)pred;
+                int resolved = resolveAliasValue(replacements, inputValueId);
+                if (resolved >= 0) {
+                    inputValueId = resolved;
+                }
+            }
+        }
+    }
+
+    for (auto& instruction : function.instructions) {
+        for (int& useValueId : instruction.uses) {
+            int resolved = resolveAliasValue(replacements, useValueId);
+            if (resolved >= 0) {
+                useValueId = resolved;
+            }
+        }
+    }
+
+    for (int valueId = 0; valueId < (int)replacements.size(); ++valueId) {
+        int replacementValueId = replacements[valueId];
+        if (replacementValueId < 0 || replacementValueId >= (int)function.values.size()) {
+            continue;
+        }
+        auto& value = function.values[valueId];
+        const auto& replacement = function.values[replacementValueId];
+        if (!value.constantValue.has_value() && replacement.constantValue.has_value()) {
+            value.constantValue = replacement.constantValue;
+        }
+    }
+
+    recomputeUseCounts(function);
+    return true;
+}
+
+static std::optional<double> numericValueFor(const SSAFunction& function, int valueId) {
+    if (valueId < 0 || valueId >= (int)function.values.size()) {
+        return std::nullopt;
+    }
+    const auto& value = function.values[valueId];
+    if (value.constantValue.has_value()) {
+        return parseNumericLiteral(*value.constantValue);
+    }
+    return parseNumericLiteral(valueText(function, valueId));
+}
+
+static bool constantIsExactly(const SSAFunction& function, int valueId, double target) {
+    auto numeric = numericValueFor(function, valueId);
+    if (!numeric.has_value()) {
+        return false;
+    }
+    return std::fabs(*numeric - target) < 1e-9;
+}
+
 static bool simplifyValueAliases(SSAFunction& function) {
     if (function.values.empty()) {
         return false;
@@ -236,57 +390,264 @@ static bool simplifyValueAliases(SSAFunction& function) {
     if (!changed) {
         return false;
     }
-
-    for (int valueId = 0; valueId < (int)replacements.size(); ++valueId) {
-        if (replacements[valueId] >= 0) {
-            replacements[valueId] = resolveAliasValue(replacements, replacements[valueId]);
-        }
+    if (!applyValueReplacements(function, replacements)) {
+        recomputeUseCounts(function);
     }
-
-    for (auto& block : function.blocks) {
-        for (auto& phi : block.phis) {
-            if (phi.dead) {
-                continue;
-            }
-            for (auto& [pred, inputValueId] : phi.inputs) {
-                (void)pred;
-                int resolved = resolveAliasValue(replacements, inputValueId);
-                if (resolved >= 0) {
-                    inputValueId = resolved;
-                }
-            }
-        }
-    }
-
-    for (auto& instruction : function.instructions) {
-        for (int& useValueId : instruction.uses) {
-            int resolved = resolveAliasValue(replacements, useValueId);
-            if (resolved >= 0) {
-                useValueId = resolved;
-            }
-        }
-    }
-
-    for (int valueId = 0; valueId < (int)replacements.size(); ++valueId) {
-        int replacementValueId = replacements[valueId];
-        if (replacementValueId < 0 || replacementValueId >= (int)function.values.size()) {
-            continue;
-        }
-        auto& value = function.values[valueId];
-        const auto& replacement = function.values[replacementValueId];
-        if (!value.constantValue.has_value() && replacement.constantValue.has_value()) {
-            value.constantValue = replacement.constantValue;
-        }
-    }
-
-    recomputeUseCounts(function);
     return true;
 }
 
-static void applyUniqueName(std::unordered_map<std::string, int>& seen, SSAVariable& value, const std::string& base) {
+static bool simplifyTypedExpressions(SSAFunction& function) {
+    if (function.values.empty()) {
+        return false;
+    }
+
+    std::vector<int> replacements(function.values.size(), -1);
+    bool changed = false;
+
+    auto aliasDefTo = [&](const SSAInstruction& instruction, int targetValueId) {
+        if (instruction.defs.size() != 1) {
+            return;
+        }
+        int defValueId = instruction.defs.front();
+        if (defValueId < 0 || defValueId >= (int)function.values.size()) {
+            return;
+        }
+        int resolvedTarget = resolveAliasValue(replacements, targetValueId);
+        if (resolvedTarget < 0 || resolvedTarget >= (int)function.values.size()) {
+            return;
+        }
+        if (defValueId == resolvedTarget || isEscapedMutableValue(function, defValueId)) {
+            return;
+        }
+        replacements[defValueId] = resolvedTarget;
+        changed = true;
+    };
+
+    for (auto& instruction : function.instructions) {
+        if (instruction.dead || instruction.defs.size() != 1) {
+            continue;
+        }
+
+        const int defValueId = instruction.defs.front();
+        if (isEscapedMutableValue(function, defValueId)) {
+            continue;
+        }
+
+        switch (instruction.inst.stdOp) {
+            case OP_CONCAT:
+                if (instruction.uses.size() == 1) {
+                    aliasDefTo(instruction, instruction.uses.front());
+                    instruction.dead = true;
+                }
+                break;
+            case OP_ADD:
+                if (instruction.uses.size() == 2) {
+                    if (constantIsExactly(function, instruction.uses[0], 0.0)) {
+                        aliasDefTo(instruction, instruction.uses[1]);
+                        instruction.dead = true;
+                    } else if (constantIsExactly(function, instruction.uses[1], 0.0)) {
+                        aliasDefTo(instruction, instruction.uses[0]);
+                        instruction.dead = true;
+                    }
+                }
+                break;
+            case OP_SUB:
+                if (instruction.uses.size() == 2 && constantIsExactly(function, instruction.uses[1], 0.0)) {
+                    aliasDefTo(instruction, instruction.uses[0]);
+                    instruction.dead = true;
+                }
+                break;
+            case OP_MUL:
+                if (instruction.uses.size() == 2) {
+                    if (constantIsExactly(function, instruction.uses[0], 1.0)) {
+                        aliasDefTo(instruction, instruction.uses[1]);
+                        instruction.dead = true;
+                    } else if (constantIsExactly(function, instruction.uses[1], 1.0)) {
+                        aliasDefTo(instruction, instruction.uses[0]);
+                        instruction.dead = true;
+                    } else if (constantIsExactly(function, instruction.uses[0], 0.0) ||
+                               constantIsExactly(function, instruction.uses[1], 0.0)) {
+                        function.values[defValueId].constantValue = "0";
+                        changed = true;
+                    }
+                }
+                break;
+            case OP_DIV:
+            case OP_IDIV:
+                if (instruction.uses.size() == 2 && constantIsExactly(function, instruction.uses[1], 1.0)) {
+                    aliasDefTo(instruction, instruction.uses[0]);
+                    instruction.dead = true;
+                }
+                break;
+            case OP_ADDK:
+            case OP_SUBK:
+            case OP_MULK:
+            case OP_DIVK:
+            case OP_MODK:
+            case OP_POWK:
+            case OP_IDIVK:
+            case OP_SUBRK:
+            case OP_DIVRK:
+            case OP_ANDK:
+            case OP_ORK:
+                if (instruction.uses.size() == 1) {
+                    auto kText = instruction.inst.constantValue;
+                    if (!kText.has_value()) {
+                        // constantValue may not be populated for *_K in older IR decoders.
+                        // leave untouched in that case.
+                        break;
+                    }
+                    auto kNumber = parseNumericLiteral(*kText);
+
+                    if (instruction.inst.stdOp == OP_ADDK && kNumber.has_value() && std::fabs(*kNumber) < 1e-9) {
+                        aliasDefTo(instruction, instruction.uses[0]);
+                        instruction.dead = true;
+                    } else if (instruction.inst.stdOp == OP_SUBK && kNumber.has_value() && std::fabs(*kNumber) < 1e-9) {
+                        aliasDefTo(instruction, instruction.uses[0]);
+                        instruction.dead = true;
+                    } else if (instruction.inst.stdOp == OP_MULK && kNumber.has_value()) {
+                        if (std::fabs(*kNumber - 1.0) < 1e-9) {
+                            aliasDefTo(instruction, instruction.uses[0]);
+                            instruction.dead = true;
+                        } else if (std::fabs(*kNumber) < 1e-9) {
+                            function.values[defValueId].constantValue = "0";
+                            changed = true;
+                        }
+                    } else if ((instruction.inst.stdOp == OP_DIVK || instruction.inst.stdOp == OP_IDIVK) &&
+                               kNumber.has_value() && std::fabs(*kNumber - 1.0) < 1e-9) {
+                        aliasDefTo(instruction, instruction.uses[0]);
+                        instruction.dead = true;
+                    } else if (instruction.inst.stdOp == OP_ANDK) {
+                        const std::string lhs = valueText(function, instruction.uses[0]);
+                        if (lhs == "false" || lhs == "nil") {
+                            aliasDefTo(instruction, instruction.uses[0]);
+                            instruction.dead = true;
+                        } else if (lhs == "true" && kText.has_value()) {
+                            function.values[defValueId].constantValue = *kText;
+                            changed = true;
+                        }
+                    } else if (instruction.inst.stdOp == OP_ORK) {
+                        const std::string lhs = valueText(function, instruction.uses[0]);
+                        if (lhs == "false" || lhs == "nil") {
+                            if (kText.has_value()) {
+                                function.values[defValueId].constantValue = *kText;
+                                changed = true;
+                            }
+                        } else if (lhs == "true") {
+                            aliasDefTo(instruction, instruction.uses[0]);
+                            instruction.dead = true;
+                        }
+                    }
+                }
+                break;
+            case OP_OR:
+                if (instruction.uses.size() == 2) {
+                    const std::string lhs = valueText(function, instruction.uses[0]);
+                    if (lhs == "true") {
+                        aliasDefTo(instruction, instruction.uses[0]);
+                        instruction.dead = true;
+                    } else if (lhs == "false" || lhs == "nil") {
+                        aliasDefTo(instruction, instruction.uses[1]);
+                        instruction.dead = true;
+                    }
+                }
+                break;
+            case OP_AND:
+                if (instruction.uses.size() == 2) {
+                    const std::string lhs = valueText(function, instruction.uses[0]);
+                    if (lhs == "true") {
+                        aliasDefTo(instruction, instruction.uses[1]);
+                        instruction.dead = true;
+                    } else if (lhs == "false" || lhs == "nil") {
+                        aliasDefTo(instruction, instruction.uses[0]);
+                        instruction.dead = true;
+                    }
+                }
+                break;
+            case OP_NOT:
+                if (instruction.uses.size() == 1) {
+                    const std::string operand = valueText(function, instruction.uses[0]);
+                    if (operand == "true") {
+                        function.values[defValueId].constantValue = "false";
+                        changed = true;
+                    } else if (operand == "false" || operand == "nil") {
+                        function.values[defValueId].constantValue = "true";
+                        changed = true;
+                    }
+                }
+                break;
+            case OP_MINUS:
+                if (instruction.uses.size() == 1) {
+                    if (auto number = numericValueFor(function, instruction.uses[0]); number.has_value()) {
+                        function.values[defValueId].constantValue = formatNumber(-*number);
+                        changed = true;
+                    }
+                }
+                break;
+            case OP_LENGTH:
+                if (instruction.uses.size() == 1) {
+                    const int srcValueId = instruction.uses[0];
+                    if (srcValueId >= 0 && srcValueId < (int)function.values.size() &&
+                        function.values[srcValueId].constantValue.has_value()) {
+                        auto quoted = asQuotedString(*function.values[srcValueId].constantValue);
+                        if (quoted.has_value()) {
+                            function.values[defValueId].constantValue = std::to_string((int)quoted->size());
+                            changed = true;
+                        }
+                    }
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    bool appliedAliases = applyValueReplacements(function, replacements);
+    if (!appliedAliases && changed) {
+        recomputeUseCounts(function);
+    }
+    return appliedAliases || changed;
+}
+
+static bool reassociateExpressions(SSAFunction& function) {
+    bool changed = false;
+    auto isConstantValueId = [&](int valueId) {
+        return valueId >= 0 && valueId < (int)function.values.size() &&
+               function.values[valueId].constantValue.has_value();
+    };
+
+    for (auto& instruction : function.instructions) {
+        if (instruction.dead || instruction.uses.size() < 2) {
+            continue;
+        }
+
+        switch (instruction.inst.stdOp) {
+            case OP_ADD:
+            case OP_MUL:
+            case OP_AND:
+            case OP_OR:
+                if (isConstantValueId(instruction.uses[0]) && !isConstantValueId(instruction.uses[1])) {
+                    std::swap(instruction.uses[0], instruction.uses[1]);
+                    changed = true;
+                }
+                break;
+            default:
+                break;
+        }
+    }
+
+    if (changed) {
+        recomputeUseCounts(function);
+    }
+    return changed;
+}
+
+static void applyUniqueName(std::unordered_map<std::string, int>& seen, SSAVariable& value, const std::string& base,
+                            float confidence) {
     std::string sanitized = toIdentifier(base);
     int count = seen[sanitized]++;
     value.name = count == 0 ? sanitized : sanitized + "_" + std::to_string(count);
+    value.nameConfidence = std::clamp(confidence, 0.0f, 1.0f);
 }
 
 static std::string stripQuotedString(const std::string& value) {
@@ -589,6 +950,16 @@ static std::string inferUsageDrivenBaseName(const SSAFunction& function, int val
                     bump("tableValue", 1);
                 }
                 break;
+            case OP_GETUPVAL:
+                bump("state", 2);
+                bump("cell", 1);
+                break;
+            case OP_SETUPVAL:
+                if (!instruction.uses.empty() && instruction.uses[0] == valueId) {
+                    bump("state", 4);
+                    bump("cell", 2);
+                }
+                break;
             case OP_SETTABLE:
                 if (instruction.uses.size() >= 3) {
                     if (instruction.uses[2] == valueId) {
@@ -611,7 +982,90 @@ static std::string inferUsageDrivenBaseName(const SSAFunction& function, int val
                     bump("name", 3);
                 } else if (*instruction.inst.keyName == "Id") {
                     bump("id", 3);
+                } else if (*instruction.inst.keyName == "Parent") {
+                    bump("parent", 4);
+                } else if (*instruction.inst.keyName == "Position") {
+                    bump("position", 3);
+                } else if (*instruction.inst.keyName == "CFrame") {
+                    bump("cframe", 3);
+                } else if (*instruction.inst.keyName == "Enabled" || *instruction.inst.keyName == "Visible") {
+                    bump("enabled", 2);
                 }
+                break;
+            case OP_CALL:
+            case OP_NATIVECALL:
+                if (instruction.uses.empty()) {
+                    break;
+                }
+                if (instruction.uses[0] == valueId) {
+                    bump("callback", 2);
+                    bump("fn", 1);
+                    break;
+                }
+
+                if (const SSAInstruction* calleeDef = definingInstruction(function, instruction.uses[0])) {
+                    if (calleeDef->inst.stdOp == OP_NAMECALL && calleeDef->inst.keyName.has_value()) {
+                        const std::string& methodName = *calleeDef->inst.keyName;
+                        if ((methodName == "FindFirstChild" || methodName == "WaitForChild" ||
+                             methodName == "FindFirstChildOfClass" || methodName == "FindFirstChildWhichIsA") &&
+                            instruction.uses.size() >= 3 && instruction.uses[2] == valueId) {
+                            bump("childName", 4);
+                        } else if ((methodName == "FindFirstAncestor" || methodName == "FindFirstAncestorOfClass" ||
+                                    methodName == "FindFirstAncestorWhichIsA") &&
+                                   instruction.uses.size() >= 3 && instruction.uses[2] == valueId) {
+                            bump("ancestorName", 4);
+                        } else if (methodName == "GetService" && instruction.uses.size() >= 3 &&
+                                   instruction.uses[2] == valueId) {
+                            bump("serviceName", 5);
+                        } else if (methodName == "GetPropertyChangedSignal" && instruction.uses.size() >= 3 &&
+                                   instruction.uses[2] == valueId) {
+                            bump("propertyName", 4);
+                        } else if (methodName == "Connect" && instruction.uses.size() >= 3 &&
+                                   instruction.uses[2] == valueId) {
+                            bump("handler", 5);
+                            bump("callback", 4);
+                        } else if (methodName == "GetTagged" && instruction.uses.size() >= 3 &&
+                                   instruction.uses[2] == valueId) {
+                            bump("tagName", 4);
+                        } else if ((methodName == "FireServer" || methodName == "InvokeServer") &&
+                                   instruction.uses.size() >= 3) {
+                            for (size_t arg = 2; arg < instruction.uses.size(); ++arg) {
+                                if (instruction.uses[arg] == valueId) {
+                                    bump("payload", arg == 2 ? 5 : 3);
+                                }
+                            }
+                        } else if (methodName == "SetAttribute" && instruction.uses.size() >= 4) {
+                            if (instruction.uses[2] == valueId) {
+                                bump("attribute", 4);
+                            }
+                            if (instruction.uses[3] == valueId) {
+                                bump("attributeValue", 4);
+                            }
+                        } else if (methodName == "GetAttribute" && instruction.uses.size() >= 3 &&
+                                   instruction.uses[2] == valueId) {
+                            bump("attribute", 4);
+                        } else if (methodName == "IsA" && instruction.uses.size() >= 3 &&
+                                   instruction.uses[2] == valueId) {
+                            bump("className", 4);
+                        } else if (methodName == "Destroy" || methodName == "Disconnect") {
+                            bump("connection", 2);
+                        }
+                    } else if (calleeDef->inst.stdOp == OP_GETIMPORT && calleeDef->inst.importName.has_value()) {
+                        const std::string& importName = *calleeDef->inst.importName;
+                        if ((importName == "pairs" || importName == "ipairs") &&
+                            instruction.uses.size() >= 2 && instruction.uses[1] == valueId) {
+                            bump("items", 4);
+                            bump("list", 2);
+                        } else if (importName == "tostring" && instruction.uses.size() >= 2 &&
+                                   instruction.uses[1] == valueId) {
+                            bump("value", 2);
+                        } else if (importName == "type" && instruction.uses.size() >= 2 &&
+                                   instruction.uses[1] == valueId) {
+                            bump("value", 2);
+                        }
+                    }
+                }
+                bump("result", 1);
                 break;
             case OP_FORGLOOP:
             case OP_FORGPREP:
@@ -632,6 +1086,7 @@ static std::string inferUsageDrivenBaseName(const SSAFunction& function, int val
                 }
                 if (isConditionalJumpOp(instruction.inst.stdOp)) {
                     bump("condition", 2);
+                    bump("flag", 3);
                 }
                 break;
         }
@@ -640,14 +1095,14 @@ static std::string inferUsageDrivenBaseName(const SSAFunction& function, int val
     std::string best;
     int bestScore = 0;
     for (const auto& [name, value] : score) {
-        if (value > bestScore) {
+        if (value > bestScore || (value == bestScore && !name.empty() && (best.empty() || name < best))) {
             bestScore = value;
             best = name;
         }
     }
     return bestScore >= 3 ? best : "";
 }
-} 
+} // namespace
 
 void inferNames(SSAFunction& function, const Function& sourceFunction, const std::vector<std::string>& upvalueAliases) {
     std::unordered_map<std::string, int> usedNames;
@@ -664,37 +1119,44 @@ void inferNames(SSAFunction& function, const Function& sourceFunction, const std
                 }
             }
             if (!localName.empty()) {
-                applyUniqueName(usedNames, value, localName);
+                applyUniqueName(usedNames, value, localName, 0.98f);
                 continue;
             }
-            applyUniqueName(usedNames, value, "p" + std::to_string(logicalSlot));
+            applyUniqueName(usedNames, value, "p" + std::to_string(logicalSlot), 0.75f);
             continue;
         }
         if (value.isUpvalue) {
             std::string base;
+            float confidence = 0.55f;
             int upvalueIndex = value.upvalueIndex;
             if (upvalueIndex >= 0 && upvalueIndex < (int)upvalueAliases.size() && !upvalueAliases[upvalueIndex].empty()) {
                 base = upvalueAliases[upvalueIndex];
+                confidence = 0.96f;
             } else if (upvalueIndex >= 0 && upvalueIndex < (int)sourceFunction.upvalueNames.size() && !sourceFunction.upvalueNames[upvalueIndex].empty()) {
                 base = sourceFunction.upvalueNames[upvalueIndex];
+                confidence = 0.9f;
             } else {
                 base = "upval" + std::to_string(upvalueIndex);
+                confidence = 0.45f;
             }
             if (base.rfind("upval", 0) == 0) {
                 std::string usageBase = inferUsageDrivenBaseName(function, value.id);
                 if (!usageBase.empty()) {
                     base = usageBase;
+                    confidence = std::max(confidence, 0.62f);
                 }
             }
-            applyUniqueName(usedNames, value, base);
+            applyUniqueName(usedNames, value, base, confidence);
             continue;
         }
 
         std::string base = "v" + std::to_string(logicalSlot);
+        float confidence = 0.35f;
         if (value.isPhi) {
             std::string phiBase = inferPhiBaseName(function, value.id);
             if (!phiBase.empty()) {
                 base = phiBase;
+                confidence = 0.62f;
             }
         }
         const SSAInstruction* def = definingInstruction(function, value.id);
@@ -702,6 +1164,7 @@ void inferNames(SSAFunction& function, const Function& sourceFunction, const std
             std::string debugLocalName = findDebugLocalName(sourceFunction, logicalSlot, def->inst.pc);
             if (!debugLocalName.empty()) {
                 base = debugLocalName;
+                confidence = 0.95f;
             }
         }
         if (def) {
@@ -709,10 +1172,13 @@ void inferNames(SSAFunction& function, const Function& sourceFunction, const std
                 int upvalueIndex = def->inst.b;
                 if (upvalueIndex >= 0 && upvalueIndex < (int)upvalueAliases.size() && !upvalueAliases[upvalueIndex].empty()) {
                     base = upvalueAliases[upvalueIndex];
+                    confidence = std::max(confidence, 0.95f);
                 } else if (upvalueIndex >= 0 && upvalueIndex < (int)sourceFunction.upvalueNames.size() && !sourceFunction.upvalueNames[upvalueIndex].empty()) {
                     base = sourceFunction.upvalueNames[upvalueIndex];
+                    confidence = std::max(confidence, 0.88f);
                 } else {
                     base = "upval" + std::to_string(upvalueIndex);
+                    confidence = std::max(confidence, 0.46f);
                 }
             } else if (def->inst.stdOp == OP_NAMECALL && def->inst.keyName.has_value()) {
                 std::string methodBase = toIdentifier(*def->inst.keyName);
@@ -721,42 +1187,77 @@ void inferNames(SSAFunction& function, const Function& sourceFunction, const std
                 } else {
                     base = methodBase + "Self";
                 }
+                confidence = std::max(confidence, 0.72f);
             } else if (def->inst.importName.has_value()) {
                 const std::string& importName = *def->inst.importName;
-                size_t dot = importName.find_last_of('.');
-                base = dot == std::string::npos ? importName : importName.substr(dot + 1);
+                if (importName == "task.spawn") {
+                    base = "spawnTask";
+                } else if (importName == "task.defer") {
+                    base = "deferTask";
+                } else if (importName == "task.wait") {
+                    base = "waitTask";
+                } else if (importName == "Instance.new") {
+                    base = "newInstance";
+                } else {
+                    size_t dot = importName.find_last_of('.');
+                    base = dot == std::string::npos ? importName : importName.substr(dot + 1);
+                }
+                confidence = std::max(confidence, 0.84f);
             } else if (def->inst.keyName.has_value()) {
                 base = *def->inst.keyName;
+                confidence = std::max(confidence, 0.76f);
             } else if (def->inst.stdOp == OP_NEWTABLE || def->inst.stdOp == OP_DUPTABLE) {
                 base = inferTableBaseName(function, value.id);
                 if (base.empty()) {
                     base = "table";
+                    confidence = std::max(confidence, 0.5f);
+                } else {
+                    confidence = std::max(confidence, 0.69f);
                 }
             } else if (def->inst.stdOp == OP_NEWCLOSURE || def->inst.stdOp == OP_DUPCLOSURE) {
                 base = inferAssignedFieldName(function, value.id);
                 if (base.empty()) {
                     base = "closure";
+                    confidence = std::max(confidence, 0.5f);
+                } else {
+                    confidence = std::max(confidence, 0.71f);
                 }
             } else if (def->inst.stdOp == OP_CALL || def->inst.stdOp == OP_NATIVECALL) {
                 base = "result";
+                confidence = std::max(confidence, 0.42f);
                 if (!def->uses.empty()) {
                     const SSAInstruction* calleeDef = definingInstruction(function, def->uses.front());
                     if (calleeDef && calleeDef->inst.stdOp == OP_NAMECALL && calleeDef->inst.keyName.has_value()) {
                         const std::string& methodName = *calleeDef->inst.keyName;
                         if (methodName == "GetService" && def->uses.size() >= 3) {
                             base = canonicalServiceVariableName(stripQuotedString(valueText(function, def->uses[2])));
+                            confidence = std::max(confidence, 0.9f);
                         } else if (methodName == "WaitForChild" && def->uses.size() >= 3) {
                             std::string childName = stripQuotedString(valueText(function, def->uses[2]));
-                            base = childName.empty() ? "child" : toIdentifier(childName);
-                        } else if (methodName == "FindFirstChild") {
+                            if (childName == "RemoteEvent") {
+                                base = "remoteEvent";
+                            } else if (childName == "RemoteFunction") {
+                                base = "remoteFunction";
+                            } else {
+                                base = childName.empty() ? "child" : toIdentifier(childName);
+                            }
+                            confidence = std::max(confidence, 0.78f);
+                        } else if (methodName == "FindFirstChild" ||
+                                   methodName == "FindFirstChildOfClass" ||
+                                   methodName == "FindFirstChildWhichIsA") {
                             if (def->uses.size() >= 3) {
                                 std::string childName = stripQuotedString(valueText(function, def->uses[2]));
                                 base = childName.empty() ? "existing" : toIdentifier(childName);
                             } else {
                                 base = "existing";
                             }
+                            confidence = std::max(confidence, 0.75f);
                         } else if (methodName == "Clone") {
                             base = "clone";
+                            confidence = std::max(confidence, 0.72f);
+                        } else if (methodName == "GetDescendants") {
+                            base = "getDescendants";
+                            confidence = std::max(confidence, 0.78f);
                         } else if (methodName == "GetChildren") {
                             if (!def->defs.empty() && value.id == def->defs.front()) {
                                 base = "children";
@@ -765,16 +1266,69 @@ void inferNames(SSAFunction& function, const Function& sourceFunction, const std
                             } else {
                                 base = "index";
                             }
+                            confidence = std::max(confidence, 0.68f);
+                        } else if (methodName == "GetPlayers") {
+                            base = "players";
+                            confidence = std::max(confidence, 0.8f);
+                        } else if (methodName == "GetAttribute") {
+                            if (def->uses.size() >= 3) {
+                                std::string attrName = stripQuotedString(valueText(function, def->uses[2]));
+                                base = attrName.empty() ? "attributeValue" : toIdentifier(attrName) + "Value";
+                            } else {
+                                base = "attributeValue";
+                            }
+                            confidence = std::max(confidence, 0.8f);
+                        } else if (methodName == "Raycast") {
+                            base = "raycastResult";
+                            confidence = std::max(confidence, 0.8f);
+                        } else if (methodName == "Connect") {
+                            base = "connection";
+                            confidence = std::max(confidence, 0.78f);
+                        } else if (methodName == "GetPropertyChangedSignal") {
+                            base = "propertyChangedSignal";
+                            confidence = std::max(confidence, 0.76f);
+                        } else if (methodName == "GetTagged") {
+                            base = "tagged";
+                            confidence = std::max(confidence, 0.76f);
+                        } else if (methodName == "FindFirstAncestor" ||
+                                   methodName == "FindFirstAncestorOfClass" ||
+                                   methodName == "FindFirstAncestorWhichIsA") {
+                            if (def->uses.size() >= 3) {
+                                std::string ancestorName = stripQuotedString(valueText(function, def->uses[2]));
+                                base = ancestorName.empty() ? "ancestor" : toIdentifier(ancestorName);
+                            } else {
+                                base = "ancestor";
+                            }
+                            confidence = std::max(confidence, 0.75f);
+                        } else if (methodName == "Wait") {
+                            base = "deltaTime";
+                            confidence = std::max(confidence, 0.72f);
+                        } else if (methodName == "FireServer") {
+                            base = "fireServerResult";
+                            confidence = std::max(confidence, 0.74f);
+                        } else if (methodName == "InvokeServer") {
+                            base = "invokeServerResult";
+                            confidence = std::max(confidence, 0.74f);
                         } else if (methodName == "IsA") {
                             if (def->uses.size() >= 3) {
                                 base = "is" + upperFirst(stripQuotedString(valueText(function, def->uses[2])));
                             } else {
                                 base = "matchesType";
                             }
+                            confidence = std::max(confidence, 0.66f);
                         } else if (methodName == "Format" || methodName == "format") {
                             base = "formatted";
+                            confidence = std::max(confidence, 0.66f);
+                        } else if (methodName.rfind("Get", 0) == 0 && methodName.size() > 3) {
+                            base = toIdentifier(methodName.substr(3));
+                            confidence = std::max(confidence, 0.6f);
+                        } else if ((methodName.rfind("Is", 0) == 0 || methodName.rfind("Has", 0) == 0) &&
+                                   methodName.size() > 2) {
+                            base = toIdentifier(methodName);
+                            confidence = std::max(confidence, 0.58f);
                         } else {
                             base = methodName;
+                            confidence = std::max(confidence, 0.62f);
                         }
                     } else if (calleeDef && calleeDef->inst.stdOp == OP_GETIMPORT && calleeDef->inst.importName.has_value()) {
                         const std::string& importName = *calleeDef->inst.importName;
@@ -784,15 +1338,19 @@ void inferNames(SSAFunction& function, const Function& sourceFunction, const std
                             } else {
                                 base = inferPcallResultBase(function, value.id);
                             }
+                            confidence = std::max(confidence, 0.7f);
                         } else if (importName == "tostring" && def->uses.size() >= 2) {
                             base = inferTostringBase(function, def->uses[1]);
+                            confidence = std::max(confidence, 0.73f);
                         }
                     }
                 }
             } else if (def->inst.stdOp == OP_CONCAT) {
                 base = "text";
+                confidence = std::max(confidence, 0.58f);
             } else if (value.isPhi) {
                 base = "merge";
+                confidence = std::max(confidence, 0.4f);
             }
         }
 
@@ -801,14 +1359,15 @@ void inferNames(SSAFunction& function, const Function& sourceFunction, const std
             std::string usageBase = inferUsageDrivenBaseName(function, value.id);
             if (!usageBase.empty()) {
                 base = usageBase;
+                confidence = std::max(confidence, 0.66f);
             }
         }
 
-        applyUniqueName(usedNames, value, base);
+        applyUniqueName(usedNames, value, base, confidence);
     }
 }
 
-void detectSemanticPatterns(SSAFunction& function) {
+static void detectMethodCallPatterns(SSAFunction& function) {
     for (auto& instruction : function.instructions) {
         if (instruction.inst.stdOp == OP_CALL && !instruction.uses.empty()) {
             const SSAInstruction* calleeDef = definingInstruction(function, instruction.uses.front());
@@ -825,10 +1384,13 @@ void detectSemanticPatterns(SSAFunction& function) {
                 text += ")";
                 instruction.semanticHint = "method_call";
                 instruction.renderedText = text;
-                continue;
             }
         }
+    }
+}
 
+static void detectIteratorPatterns(SSAFunction& function) {
+    for (auto& instruction : function.instructions) {
         if ((instruction.inst.stdOp == OP_FORGPREP || instruction.inst.stdOp == OP_FORGPREP_NEXT || instruction.inst.stdOp == OP_FORGPREP_INEXT) &&
             !instruction.uses.empty()) {
             const SSAInstruction* iteratorDef = definingInstruction(function, instruction.uses.front());
@@ -880,8 +1442,20 @@ void detectSemanticPatterns(SSAFunction& function) {
     }
 }
 
+void detectSemanticPatterns(SSAFunction& function) {
+    detectMethodCallPatterns(function);
+    detectIteratorPatterns(function);
+}
+
 void propagateConstants(SSAFunction& function, const Function& sourceFunction) {
     (void)sourceFunction;
+
+    std::unordered_set<int> mutatedUpvalueIndices;
+    for (const auto& instruction : function.instructions) {
+        if (instruction.inst.stdOp == OP_SETUPVAL) {
+            mutatedUpvalueIndices.insert(instruction.inst.b);
+        }
+    }
 
     for (auto& instruction : function.instructions) {
         if (instruction.defs.empty()) {
@@ -916,7 +1490,7 @@ void propagateConstants(SSAFunction& function, const Function& sourceFunction) {
                 }
                 break;
             case OP_GETUPVAL:
-                if (!instruction.uses.empty()) {
+                if (!instruction.uses.empty() && mutatedUpvalueIndices.count(instruction.inst.b) == 0) {
                     const auto& src = function.values[instruction.uses[0]];
                     if (!isEscapedMutableValue(function, instruction.uses[0]) && src.constantValue.has_value()) {
                         setAllDefs(*src.constantValue);
@@ -924,12 +1498,7 @@ void propagateConstants(SSAFunction& function, const Function& sourceFunction) {
                 }
                 break;
             case OP_SETUPVAL:
-                if (!instruction.uses.empty() && !isEscapedMutableValue(function, instruction.defs.front())) {
-                    const auto& src = function.values[instruction.uses[0]];
-                    if (!isEscapedMutableValue(function, instruction.uses[0]) && src.constantValue.has_value()) {
-                        setAllDefs(*src.constantValue);
-                    }
-                }
+                // Never fold setupval result cells as constants; they are mutable escaped state.
                 break;
             case OP_MOVE:
                 if (!instruction.uses.empty()) {
@@ -971,6 +1540,7 @@ void propagateConstants(SSAFunction& function, const Function& sourceFunction) {
             case OP_DIV:
             case OP_MOD:
             case OP_POW:
+            case OP_IDIV:
                 if (instruction.uses.size() >= 2) {
                     if (isEscapedMutableValue(function, instruction.uses[0]) ||
                         isEscapedMutableValue(function, instruction.uses[1])) {
@@ -987,9 +1557,64 @@ void propagateConstants(SSAFunction& function, const Function& sourceFunction) {
                             case OP_DIV: result = *lhs / *rhs; break;
                             case OP_MOD: result = std::fmod(*lhs, *rhs); break;
                             case OP_POW: result = std::pow(*lhs, *rhs); break;
+                            case OP_IDIV: result = std::floor(*lhs / *rhs); break;
                             default: break;
                         }
                         setAllDefs(formatNumber(result));
+                    }
+                }
+                break;
+            case OP_ADDK:
+            case OP_SUBK:
+            case OP_MULK:
+            case OP_DIVK:
+            case OP_MODK:
+            case OP_POWK:
+            case OP_IDIVK:
+            case OP_SUBRK:
+            case OP_DIVRK:
+                if (!instruction.uses.empty() && !isEscapedMutableValue(function, instruction.uses[0])) {
+                    auto kValueText = constantForKInstruction(sourceFunction, instruction);
+                    auto lhs = parseNumericLiteral(valueText(function, instruction.uses[0]));
+                    auto rhs = kValueText.has_value() ? parseNumericLiteral(*kValueText) : std::nullopt;
+                    if (lhs.has_value() && rhs.has_value()) {
+                        double result = 0.0;
+                        switch (instruction.inst.stdOp) {
+                            case OP_ADDK: result = *lhs + *rhs; break;
+                            case OP_SUBK: result = *lhs - *rhs; break;
+                            case OP_MULK: result = *lhs * *rhs; break;
+                            case OP_DIVK: result = *lhs / *rhs; break;
+                            case OP_MODK: result = std::fmod(*lhs, *rhs); break;
+                            case OP_POWK: result = std::pow(*lhs, *rhs); break;
+                            case OP_IDIVK: result = std::floor(*lhs / *rhs); break;
+                            case OP_SUBRK: result = *rhs - *lhs; break;
+                            case OP_DIVRK: result = *rhs / *lhs; break;
+                            default: break;
+                        }
+                        setAllDefs(formatNumber(result));
+                    }
+                }
+                break;
+            case OP_ANDK:
+            case OP_ORK:
+                if (!instruction.uses.empty() && !isEscapedMutableValue(function, instruction.uses[0])) {
+                    auto kValueText = constantForKInstruction(sourceFunction, instruction);
+                    if (kValueText.has_value()) {
+                        const std::string lhs = valueText(function, instruction.uses[0]);
+                        const std::string rhs = *kValueText;
+                        if (instruction.inst.stdOp == OP_ANDK) {
+                            if (lhs == "false" || lhs == "nil") {
+                                setAllDefs(lhs);
+                            } else if (lhs == "true") {
+                                setAllDefs(rhs);
+                            }
+                        } else {
+                            if (lhs == "false" || lhs == "nil") {
+                                setAllDefs(rhs);
+                            } else if (lhs == "true") {
+                                setAllDefs(lhs);
+                            }
+                        }
                     }
                 }
                 break;
@@ -1055,8 +1680,11 @@ SSAFunction analyzeFunction(const Chunk& chunk, const Function& function, const 
                            const std::vector<std::string>& upvalueAliases) {
     SSAFunction analyzed = buildSSAFunction(chunk, function, opmap);
     propagateConstants(analyzed, function);
-    for (int i = 0; i < 4; ++i) {
-        if (!simplifyValueAliases(analyzed)) {
+    for (int i = 0; i < 10; ++i) {
+        bool aliasChanged = simplifyValueAliases(analyzed);
+        bool expressionChanged = simplifyTypedExpressions(analyzed);
+        bool reassociated = reassociateExpressions(analyzed);
+        if (!aliasChanged && !expressionChanged && !reassociated) {
             break;
         }
         propagateConstants(analyzed, function);
@@ -1073,78 +1701,86 @@ std::string formatAnalyzedSSA(const Chunk& chunk, const OpcodeMap& opmap) {
     out << "-- Analyzed SSA Dump\n";
     out << "-- Functions: " << chunk.functions.size() << "\n\n";
 
-    for (const auto& function : chunk.functions) {
+    auto chunks = formatFunctionsParallel(chunk.functions, [&](const Function& function) {
+        std::ostringstream fnOut;
         SSAFunction analyzed = analyzeFunction(chunk, function, opmap);
-        out << "Function proto#" << function.id;
+        fnOut << "Function proto#" << function.id;
         if (!function.debugName.empty()) {
-            out << " \"" << function.debugName << "\"";
+            fnOut << " \"" << function.debugName << "\"";
         }
         if (function.lineDefined > 0) {
-            out << " line " << function.lineDefined;
+            fnOut << " line " << function.lineDefined;
         }
-        out << "\n";
+        fnOut << "\n";
 
         for (const auto& block : analyzed.blocks) {
-            out << "  block b" << block.blockId << "\n";
+            fnOut << "  block b" << block.blockId << "\n";
             for (const auto& phi : block.phis) {
                 if (phi.dead) {
                     continue;
                 }
                 const auto& result = analyzed.values[phi.resultValueId];
-                out << "    phi " << result.name;
+                fnOut << "    phi " << result.name;
+                fnOut << "@" << std::fixed << std::setprecision(2) << result.nameConfidence;
                 if (result.constantValue.has_value()) {
-                    out << " = " << *result.constantValue;
+                    fnOut << " = " << *result.constantValue;
                 }
-                out << " <- ";
+                fnOut << " <- ";
                 bool first = true;
                 for (const auto& [pred, valueId] : phi.inputs) {
-                    if (!first) out << ", ";
+                    if (!first) fnOut << ", ";
                     first = false;
-                    out << "b" << pred << ":" << analyzed.values[valueId].name;
+                    fnOut << "b" << pred << ":" << analyzed.values[valueId].name;
                 }
-                out << "\n";
+                fnOut << "\n";
             }
             for (int instIndex : block.instructionRefs) {
                 const auto& instruction = analyzed.instructions[instIndex];
                 if (instruction.dead) {
                     continue;
                 }
-                out << "    [" << instruction.inst.pc << "] " << instruction.inst.opName;
+                fnOut << "    [" << instruction.inst.pc << "] " << instruction.inst.opName;
                 if (!instruction.defs.empty()) {
-                    out << " defs=";
+                    fnOut << " defs=";
                     for (size_t i = 0; i < instruction.defs.size(); ++i) {
-                        if (i) out << ", ";
+                        if (i) fnOut << ", ";
                         const auto& value = analyzed.values[instruction.defs[i]];
-                        out << value.name;
+                        fnOut << value.name;
+                        fnOut << "@" << std::fixed << std::setprecision(2) << value.nameConfidence;
                         if (value.constantValue.has_value()) {
-                            out << "=" << *value.constantValue;
+                            fnOut << "=" << *value.constantValue;
                         }
                     }
                 }
                 if (!instruction.uses.empty()) {
-                    out << " uses=";
+                    fnOut << " uses=";
                     for (size_t i = 0; i < instruction.uses.size(); ++i) {
-                        if (i) out << ", ";
-                        out << analyzed.values[instruction.uses[i]].name;
+                        if (i) fnOut << ", ";
+                        fnOut << analyzed.values[instruction.uses[i]].name;
                     }
                 }
                 if (!instruction.clobberDefs.empty()) {
-                    out << " clobber=";
+                    fnOut << " clobber=";
                     for (size_t i = 0; i < instruction.clobberDefs.size(); ++i) {
-                        if (i) out << ", ";
-                        out << analyzed.values[instruction.clobberDefs[i]].name;
+                        if (i) fnOut << ", ";
+                        fnOut << analyzed.values[instruction.clobberDefs[i]].name;
                     }
                 }
                 if (!instruction.semanticHint.empty()) {
-                    out << " hint=" << instruction.semanticHint;
+                    fnOut << " hint=" << instruction.semanticHint;
                 }
                 if (instruction.renderedText.has_value()) {
-                    out << " render=" << *instruction.renderedText;
+                    fnOut << " render=" << *instruction.renderedText;
                 }
-                out << "\n";
+                fnOut << "\n";
             }
         }
-        out << "\n";
+        fnOut << "\n";
+        return fnOut.str();
+    });
+
+    for (const auto& chunkText : chunks) {
+        out << chunkText;
     }
 
     return out.str();

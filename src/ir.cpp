@@ -1,5 +1,8 @@
 #include "ir.hpp"
+#include <atomic>
+#include <future>
 #include <sstream>
+#include <thread>
 
 static constexpr uint32_t kJumpXEqConstantMask = 0x00ffffffu;
 static constexpr uint32_t kJumpXEqFallthroughOnMatchFlag = 0x80000000u;
@@ -67,6 +70,46 @@ static bool jumpXEqFallthroughOnMatch(uint32_t aux) {
     return (aux & kJumpXEqFallthroughOnMatchFlag) != 0;
 }
 
+template <typename Formatter>
+static std::vector<std::string> formatFunctionsParallel(const std::vector<Function>& functions, Formatter&& formatter) {
+    const size_t functionCount = functions.size();
+    std::vector<std::string> chunks(functionCount);
+    if (functionCount == 0) {
+        return chunks;
+    }
+
+    unsigned int workerCount = std::thread::hardware_concurrency();
+    if (workerCount == 0) {
+        workerCount = 4;
+    }
+    workerCount = (unsigned int)std::min<size_t>(workerCount, functionCount);
+    if (workerCount <= 1 || functionCount < 4) {
+        for (size_t i = 0; i < functionCount; ++i) {
+            chunks[i] = formatter(functions[i]);
+        }
+        return chunks;
+    }
+
+    std::atomic<size_t> nextIndex{0};
+    std::vector<std::future<void>> workers;
+    workers.reserve(workerCount);
+    for (unsigned int worker = 0; worker < workerCount; ++worker) {
+        workers.push_back(std::async(std::launch::async, [&]() {
+            while (true) {
+                size_t index = nextIndex.fetch_add(1);
+                if (index >= functionCount) {
+                    break;
+                }
+                chunks[index] = formatter(functions[index]);
+            }
+        }));
+    }
+    for (auto& worker : workers) {
+        worker.get();
+    }
+    return chunks;
+}
+
 FunctionIR decodeFunctionIR(const Function& function, const OpcodeMap& opmap) {
     FunctionIR ir;
     const int numInst = (int)function.instructions.size();
@@ -119,6 +162,25 @@ FunctionIR decodeFunctionIR(const Function& function, const OpcodeMap& opmap) {
             case OP_LOADKX:
                 if (decoded.aux < function.constants.size()) {
                     decoded.constantValue = function.constants[decoded.aux].toString({});
+                }
+                break;
+            case OP_ADDK:
+            case OP_SUBK:
+            case OP_MULK:
+            case OP_DIVK:
+            case OP_MODK:
+            case OP_POWK:
+            case OP_IDIVK:
+            case OP_ANDK:
+            case OP_ORK:
+                if (decoded.c < function.constants.size()) {
+                    decoded.constantValue = function.constants[decoded.c].toString({});
+                }
+                break;
+            case OP_SUBRK:
+            case OP_DIVRK:
+                if (decoded.b < function.constants.size()) {
+                    decoded.constantValue = function.constants[decoded.b].toString({});
                 }
                 break;
             case OP_JUMPXEQKNIL:
@@ -194,45 +256,51 @@ std::string formatInstructionIR(const Chunk& chunk, const OpcodeMap& opmap) {
     out << "-- Instruction IR Dump\n";
     out << "-- Functions: " << chunk.functions.size() << "\n\n";
 
-    for (const auto& function : chunk.functions) {
-        out << "Function proto#" << function.id;
+    auto chunks = formatFunctionsParallel(chunk.functions, [&](const Function& function) {
+        std::ostringstream fnOut;
+        fnOut << "Function proto#" << function.id;
         if (!function.debugName.empty()) {
-            out << " \"" << function.debugName << "\"";
+            fnOut << " \"" << function.debugName << "\"";
         }
         if (function.lineDefined > 0) {
-            out << " line " << function.lineDefined;
+            fnOut << " line " << function.lineDefined;
         }
-        out << "\n";
+        fnOut << "\n";
 
         FunctionIR ir = decodeFunctionIR(function, opmap);
         for (const auto& inst : ir) {
-            out << "  pc=" << inst.pc
-                << " width=" << inst.width
-                << " op=" << inst.opName
-                << " A=" << (int)inst.a
-                << " B=" << (int)inst.b
-                << " C=" << (int)inst.c
-                << " D=" << inst.d;
+            fnOut << "  pc=" << inst.pc
+                  << " width=" << inst.width
+                  << " op=" << inst.opName
+                  << " A=" << (int)inst.a
+                  << " B=" << (int)inst.b
+                  << " C=" << (int)inst.c
+                  << " D=" << inst.d;
 
             if (inst.jumpTargetPc.has_value()) {
-                out << " target=" << *inst.jumpTargetPc;
+                fnOut << " target=" << *inst.jumpTargetPc;
             }
             if (inst.importName.has_value()) {
-                out << " import=" << *inst.importName;
+                fnOut << " import=" << *inst.importName;
             }
             if (inst.keyName.has_value()) {
-                out << " key=" << *inst.keyName;
+                fnOut << " key=" << *inst.keyName;
             }
             if (inst.constantValue.has_value()) {
-                out << " const=" << *inst.constantValue;
+                fnOut << " const=" << *inst.constantValue;
             }
             if (inst.stdOp == OP_JUMPXEQKNIL || inst.stdOp == OP_JUMPXEQKB ||
                 inst.stdOp == OP_JUMPXEQKN || inst.stdOp == OP_JUMPXEQKS) {
-                out << " fallthrough=" << (inst.fallthroughOnMatch ? "match" : "mismatch");
+                fnOut << " fallthrough=" << (inst.fallthroughOnMatch ? "match" : "mismatch");
             }
-            out << "\n";
+            fnOut << "\n";
         }
-        out << "\n";
+        fnOut << "\n";
+        return fnOut.str();
+    });
+
+    for (const auto& chunkText : chunks) {
+        out << chunkText;
     }
 
     return out.str();

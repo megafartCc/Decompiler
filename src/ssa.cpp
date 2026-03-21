@@ -2,11 +2,19 @@
 #include "identifier_utils.hpp"
 #include <algorithm>
 #include <cctype>
+#include <mutex>
+#include <stdexcept>
 #include <sstream>
 #include <unordered_map>
 #include <unordered_set>
 
 namespace {
+constexpr int kMaxInstructionsForSSA = 250000;
+constexpr int kMaxCfgBlocksForSSA = 250000;
+constexpr int kMaxTotalSlotsForSSA = 65536;
+constexpr size_t kMaxPhiNodesTotal = 750000;
+constexpr size_t kMaxPhiWorklistOpsPerSlot = 200000;
+
 struct SlotAccess {
     std::vector<int> uses;
     std::vector<int> defs;
@@ -304,7 +312,7 @@ static std::unordered_map<int, std::vector<int>> computePreciseCallClobbers(
 
         auto assignUnknown = [&](int slot) {
             if (slot >= 0 && slot < slotCount) {
-                out.insert(kUnknownClosure * (slotCount + 1) - slot - 1); 
+                out.insert(kUnknownClosure * (slotCount + 1) - slot - 1); // per-slot unknown marker
             }
         };
         auto clearUnknown = [&](int slot) {
@@ -382,6 +390,16 @@ static std::unordered_map<int, std::vector<int>> computePreciseCallClobbers(
             case OP_MOVE:
                 copySlot(inst.a, inst.b);
                 break;
+            case OP_GETUPVAL: {
+                int upvalueSlot = upvalueCellSlot(function, inst.b);
+                copySlot(inst.a, upvalueSlot);
+                break;
+            }
+            case OP_SETUPVAL: {
+                int upvalueSlot = upvalueCellSlot(function, inst.b);
+                copySlot(upvalueSlot, inst.a);
+                break;
+            }
             case OP_CALL:
             case OP_NATIVECALL:
             case OP_NAMECALL:
@@ -392,7 +410,6 @@ static std::unordered_map<int, std::vector<int>> computePreciseCallClobbers(
             case OP_LOADKX:
             case OP_GETGLOBAL:
             case OP_GETIMPORT:
-            case OP_GETUPVAL:
             case OP_GETTABLE:
             case OP_GETTABLEKS:
             case OP_GETTABLEN:
@@ -435,7 +452,11 @@ static std::unordered_map<int, std::vector<int>> computePreciseCallClobbers(
             if (slot < 0 || slot >= slotCount) {
                 continue;
             }
-            if (inst.stdOp != OP_NEWCLOSURE && inst.stdOp != OP_DUPCLOSURE && inst.stdOp != OP_MOVE) {
+            if (inst.stdOp != OP_NEWCLOSURE &&
+                inst.stdOp != OP_DUPCLOSURE &&
+                inst.stdOp != OP_MOVE &&
+                inst.stdOp != OP_GETUPVAL &&
+                inst.stdOp != OP_SETUPVAL) {
                 clearSlotClosures(slot);
                 assignUnknown(slot);
             }
@@ -596,9 +617,9 @@ static SlotAccess analyzeSlotAccess(const Function& function, const DecodedInstr
                 addRange(access.defs, inst.a, inst.c - 1);
             }
             for (int slot : callClobberSlots) {
-                
-                
-                
+                // OPEN-result calls (C==0) conceptually overwrite the return window from A upward.
+                // Keep those slots untouched here so loop-iterator/result recovery can still reason
+                // about returned registers; upvalue-cell clobbers still apply.
                 if (inst.c == 0 && slot >= inst.a && slot < function.maxStackSize) {
                     continue;
                 }
@@ -825,10 +846,21 @@ static std::string localNameForSlot(const Function& function, int slot) {
         }
         return "upval" + std::to_string(upvalueIndex);
     }
+
+    const LocalVarInfo* bestLocal = nullptr;
     for (const auto& local : function.locals) {
-        if (local.slot == slot && local.startPc == 0 && !local.name.empty() && local.name[0] != '(') {
+        if (local.slot != slot || local.name.empty() || local.name[0] == '(') {
+            continue;
+        }
+        if (local.startPc == 0) {
             return sanitizeLuaIdentifier(local.name, slot < function.numParams ? "p" : "v");
         }
+        if (!bestLocal || local.startPc < bestLocal->startPc) {
+            bestLocal = &local;
+        }
+    }
+    if (bestLocal) {
+        return sanitizeLuaIdentifier(bestLocal->name, slot < function.numParams ? "p" : "v");
     }
     return "";
 }
@@ -881,16 +913,29 @@ static void renameBlock(SSAFunction& ssa, const Function& function, int blockId,
         }
     }
 }
-} 
+} // namespace
 
 SSAFunction buildSSAFunction(const Chunk& chunk, const Function& function, const OpcodeMap& opmap) {
+    if (function.instructions.size() > kMaxInstructionsForSSA) {
+        throw std::runtime_error("ssa guard: instruction count too large");
+    }
+
     SSAFunction ssa;
     ssa.functionId = function.id;
     ssa.name = function.debugName;
     ssa.ir = decodeFunctionIR(function, opmap);
+    if (ssa.ir.size() > kMaxInstructionsForSSA) {
+        throw std::runtime_error("ssa guard: decoded IR too large");
+    }
     ssa.cfg = buildControlFlowGraph(function, opmap);
+    if (ssa.cfg.blocks.size() > kMaxCfgBlocksForSSA) {
+        throw std::runtime_error("ssa guard: CFG block count too large");
+    }
     ssa.escapedMutableSlots = collectEscapedMutableSlots(function, ssa.ir);
     const int rawSlotCount = function.maxStackSize + function.numUpvalues;
+    if (rawSlotCount <= 0 || rawSlotCount > kMaxTotalSlotsForSSA) {
+        throw std::runtime_error("ssa guard: slot count out of range");
+    }
 
     auto isStableEscapedLocalSlot = [&](int slot) -> bool {
         if (slot >= 0 && slot < function.numParams) {
@@ -925,6 +970,9 @@ SSAFunction buildSSAFunction(const Chunk& chunk, const Function& function, const
 
     ssa.blocks.resize(ssa.cfg.blocks.size());
     const int totalSlots = nextCellSlot;
+    if (totalSlots <= 0 || totalSlots > kMaxTotalSlotsForSSA) {
+        throw std::runtime_error("ssa guard: total SSA slot count too large");
+    }
 
     std::vector<int> callClobberSlots;
     callClobberSlots.reserve(ssa.escapedMutableSlots.size() + ssa.escapedSlotToCellSlot.size());
@@ -943,19 +991,25 @@ SSAFunction buildSSAFunction(const Chunk& chunk, const Function& function, const
     callClobberSlots.erase(std::unique(callClobberSlots.begin(), callClobberSlots.end()), callClobberSlots.end());
 
     static std::unordered_map<const Chunk*, std::unordered_map<int, std::unordered_set<int>>> summaryCache;
-    auto cacheIt = summaryCache.find(&chunk);
-    if (cacheIt == summaryCache.end()) {
-        cacheIt = summaryCache.emplace(&chunk, computeTransitiveUpvalueWriteSummaries(chunk, opmap)).first;
+    static std::mutex summaryCacheMutex;
+    const std::unordered_map<int, std::unordered_set<int>>* transitiveUpvalueWrites = nullptr;
+    {
+        std::lock_guard<std::mutex> lock(summaryCacheMutex);
+        auto cacheIt = summaryCache.find(&chunk);
+        if (cacheIt == summaryCache.end()) {
+            cacheIt = summaryCache.emplace(&chunk, computeTransitiveUpvalueWriteSummaries(chunk, opmap)).first;
+        }
+        transitiveUpvalueWrites = &cacheIt->second;
     }
-    const auto& transitiveUpvalueWrites = cacheIt->second;
 
     auto preciseCallClobbers = computePreciseCallClobbers(
-        chunk, function, ssa.ir, ssa.escapedMutableSlots, callClobberSlots, transitiveUpvalueWrites
+        chunk, function, ssa.ir, ssa.escapedMutableSlots, callClobberSlots, *transitiveUpvalueWrites
     );
 
     for (const auto& block : ssa.cfg.blocks) {
         ssa.blocks[block.id].blockId = block.id;
     }
+    ssa.instructions.reserve(ssa.ir.size());
 
     constexpr int kNoOpenResult = -1;
     int openResultBase = kNoOpenResult;
@@ -1080,16 +1134,24 @@ SSAFunction buildSSAFunction(const Chunk& chunk, const Function& function, const
         }
     }
 
+    size_t totalPhiNodes = 0;
     for (int slot = 0; slot < totalSlots; ++slot) {
         std::vector<int> worklist = definitionBlocks[slot];
         std::unordered_set<int> visited(worklist.begin(), worklist.end());
         std::unordered_set<int> hasPhi;
+        size_t worklistOps = 0;
 
         while (!worklist.empty()) {
+            if (++worklistOps > kMaxPhiWorklistOpsPerSlot) {
+                throw std::runtime_error("ssa guard: phi worklist exceeded per-slot limit");
+            }
             int blockId = worklist.back();
             worklist.pop_back();
             for (int frontierBlock : ssa.dominanceFrontier[blockId]) {
                 if (hasPhi.insert(frontierBlock).second) {
+                    if (++totalPhiNodes > kMaxPhiNodesTotal) {
+                        throw std::runtime_error("ssa guard: phi node count exceeded global limit");
+                    }
                     PhiNode phi;
                     phi.blockId = frontierBlock;
                     phi.slot = slot;
@@ -1172,7 +1234,10 @@ SSAFunction buildSSAFunction(const Chunk& chunk, const Function& function, const
                 baseName = "upval" + std::to_string(value.upvalueIndex);
             }
         } else {
-            baseName = "v" + std::to_string(logicalSlot);
+            baseName = localNameForSlot(function, logicalSlot);
+            if (baseName.empty()) {
+                baseName = "v" + std::to_string(logicalSlot);
+            }
         }
 
         if (isEscapedCellValue && !value.isParameter && !value.isUpvalue) {

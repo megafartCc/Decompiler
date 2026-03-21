@@ -1,11 +1,50 @@
 #include "deserializer.hpp"
 #include "reader.hpp"
+#include "identifier_utils.hpp"
+#include <algorithm>
 #include <cstdio>
 #include <cmath>
+#include <cctype>
 
+namespace {
+static std::string escapeLuaStringLiteral(const std::string& value) {
+    std::string escaped;
+    escaped.reserve(value.size() + 8);
+    for (unsigned char ch : value) {
+        switch (ch) {
+            case '\\':
+                escaped += "\\\\";
+                break;
+            case '\"':
+                escaped += "\\\"";
+                break;
+            case '\n':
+                escaped += "\\n";
+                break;
+            case '\r':
+                escaped += "\\r";
+                break;
+            case '\t':
+                escaped += "\\t";
+                break;
+            default:
+                if (ch < 32 || ch == 127) {
+                    char buf[8];
+                    std::snprintf(buf, sizeof(buf), "\\x%02X", static_cast<unsigned int>(ch));
+                    escaped += buf;
+                } else {
+                    escaped.push_back(static_cast<char>(ch));
+                }
+                break;
+        }
+    }
+    return "\"" + escaped + "\"";
+}
+} // namespace
 
-
-
+// ==========================================
+// Constant::toString
+// ==========================================
 std::string Constant::toString(const std::vector<std::string>& strings) const {
     switch (type) {
         case ConstantType::Nil:     return "nil";
@@ -15,7 +54,7 @@ std::string Constant::toString(const std::vector<std::string>& strings) const {
                 return "0/0";
             if (std::isinf(numVal))
                 return numVal < 0 ? "-math.huge" : "math.huge";
-            
+            // Pretty print integers vs floats
             if (numVal == (double)(int64_t)numVal && std::abs(numVal) < 1e15)
                 return std::to_string((int64_t)numVal);
             char buf[64];
@@ -23,12 +62,26 @@ std::string Constant::toString(const std::vector<std::string>& strings) const {
             return buf;
         }
         case ConstantType::String:
-            return "\"" + strVal + "\"";
+            return escapeLuaStringLiteral(strVal);
         case ConstantType::Import: {
+            if (importNames.empty()) {
+                return "import(...)";
+            }
             std::string s;
-            for (size_t i = 0; i < importNames.size(); i++) {
-                if (i > 0) s += ".";
-                s += importNames[i];
+            if (isLuaIdentifier(importNames[0])) {
+                s = importNames[0];
+            } else {
+                s = "_G[" + escapeLuaStringLiteral(importNames[0]) + "]";
+            }
+            for (size_t i = 1; i < importNames.size(); i++) {
+                if (isLuaIdentifier(importNames[i])) {
+                    s += ".";
+                    s += importNames[i];
+                } else {
+                    s += "[";
+                    s += escapeLuaStringLiteral(importNames[i]);
+                    s += "]";
+                }
             }
             return s;
         }
@@ -45,9 +98,9 @@ std::string Constant::toString(const std::vector<std::string>& strings) const {
     return "<?>";
 }
 
-
-
-
+// ==========================================
+// Deserializer
+// ==========================================
 static std::string readStringRef(BytecodeReader& r, const std::vector<std::string>& strings) {
     int id = r.readVarInt();
     if (id == 0 || id > (int)strings.size()) return "";
@@ -68,7 +121,20 @@ static std::vector<std::string> readStringTable(BytecodeReader& r) {
 static Constant readConstant(BytecodeReader& r, const std::vector<std::string>& strings,
                               const std::vector<Constant>& constants) {
     Constant c;
-    uint8_t type = r.readByte();
+    uint8_t rawType = r.readByte();
+    uint8_t type = rawType;
+    static int remapWarnCount = 0;
+
+    // Some protected/custom chunks encode constant tags with high bits.
+    // Preserve low-bit semantic tag as a best-effort recovery path.
+    if (type > 7 && type != 9 && type != 64) {
+        type = type & 7;
+        if (remapWarnCount < 32) {
+            fprintf(stderr, "[*] Remapped constant type %u -> %u\n", (unsigned)rawType, (unsigned)type);
+            remapWarnCount++;
+        }
+    }
+
     c.type = (ConstantType)type;
 
     switch (c.type) {
@@ -134,15 +200,23 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
     if (version >= 4) {
         f.flags = r.readByte();
         int typesSize = r.readVarInt();
-        r.skip(typesSize);
+        f.typeInfoSize = typesSize;
+        f.hasTypeInfo = typesSize > 0;
+        if (typesSize > 0) {
+            size_t start = r.position();
+            f.typeInfoBlob.resize((size_t)typesSize);
+            const uint8_t* raw = r.rawAt(start);
+            std::copy(raw, raw + typesSize, f.typeInfoBlob.begin());
+            r.skip(typesSize);
+        }
 
-        
+        // Handle types version specific data (skip)
         if (typesVersion == 1) {
-            
+            // Already skipped via typesSize above
         }
     }
 
-    
+    // Instructions (uint32 each)
     {
         int count = r.readVarInt();
         f.instructions.reserve(count);
@@ -153,7 +227,7 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
         }
     }
 
-    
+    // Constants
     {
         int count = r.readVarInt();
         f.constants.reserve(count);
@@ -162,7 +236,7 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
         }
     }
 
-    
+    // Child proto indices
     {
         int count = r.readVarInt();
         for (int i = 0; i < count; i++)
@@ -172,7 +246,7 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
     f.lineDefined = r.readVarInt();
     f.debugName   = readStringRef(r, strings);
 
-    
+    // Line info
     if (r.readBool()) {
         f.hasLineInfo = true;
         f.lineGapLog = r.readByte();
@@ -194,7 +268,7 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
         }
     }
 
-    
+    // Debug info
     if (r.readBool()) {
         int sizeVars = r.readVarInt();
         for (int i = 0; i < sizeVars; i++) {
@@ -216,18 +290,29 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
 Chunk deserialize(const uint8_t* data, size_t size) {
     BytecodeReader r(data, size);
     Chunk chunk;
+    bool tolerantMode = false;
 
-    chunk.version = r.readByte();
+    uint8_t rawVersion = r.readByte();
+    chunk.version = rawVersion;
 
-    
+    // Version 0 means error message follows
     if (chunk.version == 0) {
         std::string err;
         while (!r.eof()) err += (char)r.readByte();
         throw std::runtime_error("Bytecode contains error: " + err);
     }
     
-    
+    // Bypass version check since the official compiler uses v255 (which maps to v6)
     if (chunk.version == 255) chunk.version = 6;
+    else if (chunk.version > 6) {
+        // Non-standard streams sometimes encode flags in high bits.
+        uint8_t coerced = chunk.version & 7;
+        if (coerced == 0) coerced = 3;
+        fprintf(stderr, "[*] Coerced non-standard bytecode version %u -> %u\n",
+            (unsigned)chunk.version, (unsigned)coerced);
+        chunk.version = coerced;
+        tolerantMode = true;
+    }
 
     fprintf(stderr, "[*] Bytecode version: %d\n", chunk.version);
 
@@ -235,11 +320,11 @@ Chunk deserialize(const uint8_t* data, size_t size) {
     if (chunk.version >= 4)
         chunk.typesVersion = r.readByte();
 
-    
+    // String table
     chunk.strings = readStringTable(r);
     fprintf(stderr, "[*] Loaded %zu strings\n", chunk.strings.size());
 
-    
+    // Types version 3: userdata remapping (skip)
     if (chunk.typesVersion == 3) {
         uint8_t idx = r.readByte();
         while (idx != 0) {
@@ -248,17 +333,44 @@ Chunk deserialize(const uint8_t* data, size_t size) {
         }
     }
 
-    
+    // Functions
     int funcCount = r.readVarInt();
     fprintf(stderr, "[*] Loading %d functions\n", funcCount);
     chunk.functions.reserve(funcCount);
     for (int i = 0; i < funcCount; i++) {
-        Function f = readFunction(r, chunk.strings, chunk.version, chunk.typesVersion);
-        f.id = i;
-        chunk.functions.push_back(std::move(f));
+        try {
+            Function f = readFunction(r, chunk.strings, chunk.version, chunk.typesVersion);
+            f.id = i;
+            chunk.functions.push_back(std::move(f));
+        } catch (const std::exception& ex) {
+            if (!tolerantMode) {
+                throw;
+            }
+            fprintf(stderr, "[*] Tolerant stop while reading function %d/%d: %s\n", i, funcCount, ex.what());
+            break;
+        }
     }
 
-    chunk.mainIndex = r.readVarInt();
+    if (!r.eof()) {
+        try {
+            chunk.mainIndex = r.readVarInt();
+        } catch (const std::exception& ex) {
+            if (!tolerantMode) {
+                throw;
+            }
+            fprintf(stderr, "[*] Tolerant main index fallback: %s\n", ex.what());
+            chunk.mainIndex = chunk.functions.empty() ? 0 : (int)chunk.functions.size() - 1;
+        }
+    } else {
+        chunk.mainIndex = chunk.functions.empty() ? 0 : (int)chunk.functions.size() - 1;
+    }
+
+    if (!chunk.functions.empty() && (chunk.mainIndex < 0 || chunk.mainIndex >= (int)chunk.functions.size())) {
+        if (tolerantMode) {
+            chunk.mainIndex = (int)chunk.functions.size() - 1;
+        }
+    }
+
     fprintf(stderr, "[*] Main function index: %d\n", chunk.mainIndex);
     fprintf(stderr, "[*] Bytes remaining: %zu\n", r.size() - r.position());
 

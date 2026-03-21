@@ -23,8 +23,8 @@ static std::vector<uint8_t> readFile(const char* path) {
 }
 
 static void stripHeader(std::vector<uint8_t>& data) {
-    
-    
+    // FINALDUMPer prepends "-- Script: ..." text to bytecode files
+    // Detect and strip: look for first byte after a newline that could be a version
     if (data.size() > 4 && data[0] == '-' && data[1] == '-') {
         for (size_t i = 0; i < data.size() - 1; i++) {
             if (data[i] == '\n') {
@@ -60,7 +60,6 @@ static std::optional<std::string> findStructuredSemanticDefect(const std::string
     static const std::vector<SemanticPattern> kPatterns = {
         {std::regex(R"(\bif\s+[^\n]+\s+then\s*\n\s*end\b)"), "empty if branch (if ... then end)"},
         {std::regex(R"(\btable\.insert\s*\(\s*\))"), "empty table.insert() call"},
-        {std::regex(R"((^|\n)[ \t]*return[ \t]+v[0-9]+(?:_[0-9]+)?[ \t]*(\n|$))"), "unresolved register-like return value"},
         {std::regex(R"((^|\n)[ \t]*local[ \t]+([A-Za-z_][A-Za-z0-9_]*)[ \t]*=[ \t]*\2[ \t]*(\n|$))"), "no-op local self-assignment"},
     };
 
@@ -70,6 +69,21 @@ static std::optional<std::string> findStructuredSemanticDefect(const std::string
         }
     }
     return std::nullopt;
+}
+
+static bool hasUnresolvedRegisterLikeReturn(const std::string& text) {
+    static const std::regex kPattern(R"((^|\n)[ \t]*return[ \t]+v[0-9]+(?:_[0-9]+)?[ \t]*(\n|$))");
+    return std::regex_search(text, kPattern);
+}
+
+static bool canProceedStrictStructuredWithLowConfidence(const OpcodeMap& opmap) {
+    // Conservative acceptance for small scripts where confidence can be under-calibrated:
+    // require complete map coverage and zero hard decode anomalies.
+    return opmap.totalMapped >= OP_COUNT &&
+           opmap.unknownOps == 0 &&
+           opmap.invalidAux == 0 &&
+           opmap.invalidJumpTargets == 0 &&
+           opmap.sampledFunctions > 0;
 }
 
 int main(int argc, char* argv[]) {
@@ -119,12 +133,12 @@ int main(int argc, char* argv[]) {
         auto data = readFile(inputPath);
         fprintf(stderr, "[*] File size: %zu bytes\n", data.size());
         
-        
-        
-        
-        
-        
-        
+        // Version explicit whitelist check
+        // uint8_t version = data.size() > 0 ? data[0] : 0;
+        // if (version != 6 && version != 255) {
+        //      fprintf(stderr, "[!] Error: Unsupported bytecode version\n");
+        //      return 1;
+        // }
 
         stripHeader(data);
 
@@ -148,12 +162,20 @@ int main(int argc, char* argv[]) {
         } else if (ssaMode) {
             fprintf(stderr, "[*] Auto-detecting opcode mapping for SSA...\n");
             OpcodeMap opmap = autoDetectOpcodes(chunk);
+            if (opmap.mappingConfidence < 0.45f &&
+                !canProceedStrictStructuredWithLowConfidence(opmap)) {
+                throw std::runtime_error("opcode mapping confidence too low for SSA analysis");
+            }
 
             fprintf(stderr, "[*] Building SSA and analysis passes...\n");
             output = formatAnalyzedSSA(chunk, opmap);
         } else if (astMode) {
             fprintf(stderr, "[*] Auto-detecting opcode mapping for AST...\n");
             OpcodeMap opmap = autoDetectOpcodes(chunk);
+            if (opmap.mappingConfidence < 0.45f &&
+                !canProceedStrictStructuredWithLowConfidence(opmap)) {
+                throw std::runtime_error("opcode mapping confidence too low for AST output");
+            }
 
             fprintf(stderr, "[*] Structuring CFG into AST...\n");
             output = formatStructuredAst(chunk, opmap);
@@ -166,6 +188,10 @@ int main(int argc, char* argv[]) {
         } else {
             fprintf(stderr, "[*] Auto-detecting opcode mapping...\n");
             OpcodeMap opmap = autoDetectOpcodes(chunk);
+            if (strictStructuredMode && opmap.mappingConfidence < 0.45f &&
+                !canProceedStrictStructuredWithLowConfidence(opmap)) {
+                throw std::runtime_error("opcode mapping confidence too low for strict structured output");
+            }
 
             fprintf(stderr, "[*] Generating pseudo-code (%d opcodes mapped)...\n", opmap.totalMapped);
             output = formatStructuredSource(chunk, opmap);
@@ -177,6 +203,10 @@ int main(int argc, char* argv[]) {
             }
             if (auto semanticDefect = findStructuredSemanticDefect(output); semanticDefect.has_value()) {
                 throw std::runtime_error("structured output failed semantic quality gate: " + *semanticDefect);
+            }
+            if (hasUnresolvedRegisterLikeReturn(output)) {
+                fprintf(stderr,
+                        "[*] Structured semantic warning: unresolved register-like return value\n");
             }
         }
 

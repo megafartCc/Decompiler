@@ -33,14 +33,43 @@ inline bool isLuaIdentifier(std::string_view value) {
 }
 
 inline std::string sanitizeLuaIdentifier(std::string value, const std::string& fallbackPrefix = "v") {
+    std::string fallback = fallbackPrefix.empty() ? "v" : fallbackPrefix;
+    std::string cleanedFallback;
+    cleanedFallback.reserve(fallback.size() + 1);
+    for (char ch : fallback) {
+        unsigned char uch = static_cast<unsigned char>(ch);
+        cleanedFallback.push_back((std::isalnum(uch) || ch == '_') ? ch : '_');
+    }
+    if (cleanedFallback.empty()) {
+        cleanedFallback = "v";
+    }
+    if (std::isdigit(static_cast<unsigned char>(cleanedFallback.front()))) {
+        cleanedFallback.insert(cleanedFallback.begin(), 'v');
+    }
+
     if (value.empty()) {
-        value = fallbackPrefix;
+        value = cleanedFallback;
     }
-    if (value.empty() || std::isdigit(static_cast<unsigned char>(value.front()))) {
-        value = fallbackPrefix + value;
+
+    std::string sanitized;
+    sanitized.reserve(value.size() + 4);
+    for (char ch : value) {
+        unsigned char uch = static_cast<unsigned char>(ch);
+        if (std::isalnum(uch) || ch == '_') {
+            sanitized.push_back(ch);
+        } else if (sanitized.empty() || sanitized.back() != '_') {
+            sanitized.push_back('_');
+        }
     }
-    if (isLuaKeyword(value)) {
-        value.push_back('_');
+
+    if (sanitized.empty()) {
+        sanitized = cleanedFallback;
     }
-    return value;
+    if (std::isdigit(static_cast<unsigned char>(sanitized.front()))) {
+        sanitized = cleanedFallback + "_" + sanitized;
+    }
+    if (isLuaKeyword(sanitized)) {
+        sanitized.push_back('_');
+    }
+    return sanitized;
 }

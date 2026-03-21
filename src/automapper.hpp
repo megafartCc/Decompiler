@@ -3,7 +3,7 @@
 #include <unordered_map>
 #include <string>
 
-
+// Standard Luau opcodes (open-source Luau order)
 enum StdOp : int {
     OP_NOP = 0, OP_BREAK, OP_LOADNIL, OP_LOADB, OP_LOADN, OP_LOADK, OP_MOVE,
     OP_GETGLOBAL, OP_SETGLOBAL, OP_GETUPVAL, OP_SETUPVAL, OP_CLOSEUPVALS,
@@ -33,14 +33,21 @@ enum StdOp : int {
 const char* stdOpName(int op);
 
 struct OpcodeMap {
-    int toStd[256];    
-    int fromStd[256];  
+    int toStd[256];    // shuffled -> standard (-1 = unknown)
+    int fromStd[256];  // standard -> shuffled (-1 = unknown)
     float confidence[256];
     int totalMapped = 0;
+    int detectedEncodeKey = -1;
+    float mappingConfidence = 0.0f;
+    bool usedFallback = false;
+    int sampledFunctions = 0;
+    int unknownOps = 0;
+    int invalidAux = 0;
+    int invalidJumpTargets = 0;
 
     void assign(int shuffled, int standard, float conf);
     int  lookup(uint8_t shuffled) const { return toStd[shuffled]; }
 };
 
-
+// Analyze bytecode and auto-detect opcode mapping
 OpcodeMap autoDetectOpcodes(const Chunk& chunk);

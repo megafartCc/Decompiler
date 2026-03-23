@@ -138,8 +138,6 @@ static Constant readConstant(BytecodeReader& r, const std::vector<std::string>& 
     c.type = (ConstantType)type;
 
     switch (c.type) {
-        case 64:
-        case 9:
         case ConstantType::Nil:
             break;
         case ConstantType::Bool:

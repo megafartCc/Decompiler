@@ -5,8 +5,27 @@
 #include <cstdio>
 #include <cmath>
 #include <cctype>
+#include <stdexcept>
 
 namespace {
+static size_t remainingBytes(const BytecodeReader& r) {
+    return r.size() - r.position();
+}
+
+static void requireRemaining(const BytecodeReader& r, size_t bytes, const char* what) {
+    if (bytes > remainingBytes(r)) {
+        throw std::runtime_error(std::string("Bytecode truncated while reading ") + what);
+    }
+}
+
+static int readBoundedVarInt(BytecodeReader& r, size_t maxValue, const char* what) {
+    int value = r.readVarInt();
+    if (value < 0 || (size_t)value > maxValue) {
+        throw std::runtime_error(std::string("Invalid ") + what + " count: " + std::to_string(value));
+    }
+    return value;
+}
+
 static std::string escapeLuaStringLiteral(const std::string& value) {
     std::string escaped;
     escaped.reserve(value.size() + 8);
@@ -65,7 +84,7 @@ std::string Constant::toString(const std::vector<std::string>& strings) const {
             return escapeLuaStringLiteral(strVal);
         case ConstantType::Import: {
             if (importNames.empty()) {
-                return "import(...)";
+                return "import_unknown";
             }
             std::string s;
             if (isLuaIdentifier(importNames[0])) {
@@ -108,11 +127,11 @@ static std::string readStringRef(BytecodeReader& r, const std::vector<std::strin
 }
 
 static std::vector<std::string> readStringTable(BytecodeReader& r) {
-    int count = r.readVarInt();
+    int count = readBoundedVarInt(r, remainingBytes(r), "string table");
     std::vector<std::string> strings;
     strings.reserve(count);
     for (int i = 0; i < count; i++) {
-        int len = r.readVarInt();
+        int len = readBoundedVarInt(r, remainingBytes(r), "string length");
         strings.push_back(r.readString(len));
     }
     return strings;
@@ -138,6 +157,8 @@ static Constant readConstant(BytecodeReader& r, const std::vector<std::string>& 
     c.type = (ConstantType)type;
 
     switch (c.type) {
+        case 64:
+        case 9:
         case ConstantType::Nil:
             break;
         case ConstantType::Bool:
@@ -167,7 +188,7 @@ static Constant readConstant(BytecodeReader& r, const std::vector<std::string>& 
             break;
         }
         case ConstantType::Table: {
-            int size = r.readVarInt();
+            int size = readBoundedVarInt(r, remainingBytes(r), "table constant key");
             for (int i = 0; i < size; i++)
                 c.tableKeys.push_back(r.readVarInt());
             break;
@@ -197,11 +218,12 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
 
     if (version >= 4) {
         f.flags = r.readByte();
-        int typesSize = r.readVarInt();
+        int typesSize = readBoundedVarInt(r, remainingBytes(r), "type info");
         f.typeInfoSize = typesSize;
         f.hasTypeInfo = typesSize > 0;
         if (typesSize > 0) {
             size_t start = r.position();
+            requireRemaining(r, (size_t)typesSize, "type info blob");
             f.typeInfoBlob.resize((size_t)typesSize);
             const uint8_t* raw = r.rawAt(start);
             std::copy(raw, raw + typesSize, f.typeInfoBlob.begin());
@@ -216,7 +238,7 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
 
     // Instructions (uint32 each)
     {
-        int count = r.readVarInt();
+        int count = readBoundedVarInt(r, remainingBytes(r) / 4, "instruction");
         f.instructions.reserve(count);
         for (int i = 0; i < count; i++) {
             RawInstruction inst;
@@ -227,7 +249,7 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
 
     // Constants
     {
-        int count = r.readVarInt();
+        int count = readBoundedVarInt(r, remainingBytes(r), "constant");
         f.constants.reserve(count);
         for (int i = 0; i < count; i++) {
             f.constants.push_back(readConstant(r, strings, f.constants));
@@ -236,7 +258,7 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
 
     // Child proto indices
     {
-        int count = r.readVarInt();
+        int count = readBoundedVarInt(r, remainingBytes(r), "child proto");
         for (int i = 0; i < count; i++)
             f.childProtos.push_back(r.readVarInt());
     }
@@ -245,41 +267,80 @@ static Function readFunction(BytecodeReader& r, const std::vector<std::string>& 
     f.debugName   = readStringRef(r, strings);
 
     // Line info
-    if (r.readBool()) {
+    size_t lineFlagPos = r.position();
+    uint8_t lineFlag = r.readByte();
+    if (lineFlag > 1) {
+        if (f.instructions.empty()) {
+            r.seek(lineFlagPos);
+            return f;
+        }
+        lineFlag = 1;
+    }
+    if (lineFlag == 1) {
         f.hasLineInfo = true;
         f.lineGapLog = r.readByte();
         int instrCount = (int)f.instructions.size();
-        int intervals = ((instrCount - 1) >> f.lineGapLog) + 1;
+        if (instrCount <= 0) {
+            f.hasLineInfo = false;
+        } else if (f.lineGapLog >= 31) {
+            throw std::runtime_error("Invalid line info header at offset " + std::to_string(r.position()) +
+                                     " (instructions=" + std::to_string(instrCount) +
+                                     ", lineGapLog=" + std::to_string((unsigned)f.lineGapLog) + ")");
+        } else {
+            int intervals = ((instrCount - 1) >> f.lineGapLog) + 1;
+            requireRemaining(r, (size_t)instrCount + (size_t)intervals * 4, "line info");
 
-        f.lineOffsets.resize(instrCount);
-        uint8_t lastOffset = 0;
-        for (int i = 0; i < instrCount; i++) {
-            lastOffset += r.readByte();
-            f.lineOffsets[i] = lastOffset;
-        }
+            f.lineOffsets.resize(instrCount);
+            uint8_t lastOffset = 0;
+            for (int i = 0; i < instrCount; i++) {
+                lastOffset += r.readByte();
+                f.lineOffsets[i] = lastOffset;
+            }
 
-        f.absLineInfo.resize(intervals);
-        int32_t lastLine = 0;
-        for (int i = 0; i < intervals; i++) {
-            lastLine += r.readInt32();
-            f.absLineInfo[i] = lastLine;
+            f.absLineInfo.resize(intervals);
+            int32_t lastLine = 0;
+            for (int i = 0; i < intervals; i++) {
+                lastLine += r.readInt32();
+                f.absLineInfo[i] = lastLine;
+            }
         }
     }
 
     // Debug info
-    if (r.readBool()) {
-        int sizeVars = r.readVarInt();
-        for (int i = 0; i < sizeVars; i++) {
-            LocalVarInfo v;
-            v.name    = readStringRef(r, strings);
-            v.startPc = r.readVarInt();
-            v.endPc   = r.readVarInt();
-            v.slot    = r.readByte();
-            f.locals.push_back(v);
+    size_t debugFlagPos = r.position();
+    uint8_t debugFlag = r.readByte();
+    bool looseDebugFlag = false;
+    if (debugFlag > 1) {
+        if (f.instructions.empty()) {
+            r.seek(debugFlagPos);
+            return f;
         }
-        int sizeUpvals = r.readVarInt();
-        for (int i = 0; i < sizeUpvals; i++)
-            f.upvalueNames.push_back(readStringRef(r, strings));
+        debugFlag = 1;
+        looseDebugFlag = true;
+    }
+    if (debugFlag == 1) {
+        try {
+            int sizeVars = readBoundedVarInt(r, remainingBytes(r) / 4, "local debug variable");
+            for (int i = 0; i < sizeVars; i++) {
+                LocalVarInfo v;
+                v.name    = readStringRef(r, strings);
+                v.startPc = r.readVarInt();
+                v.endPc   = r.readVarInt();
+                v.slot    = r.readByte();
+                f.locals.push_back(v);
+            }
+            int sizeUpvals = readBoundedVarInt(r, remainingBytes(r), "debug upvalue");
+            for (int i = 0; i < sizeUpvals; i++)
+                f.upvalueNames.push_back(readStringRef(r, strings));
+        } catch (const std::exception&) {
+            if (!looseDebugFlag) {
+                throw;
+            }
+            f.locals.clear();
+            f.upvalueNames.clear();
+            r.seek(debugFlagPos);
+            return f;
+        }
     }
 
     return f;
@@ -300,17 +361,16 @@ Chunk deserialize(const uint8_t* data, size_t size) {
         throw std::runtime_error("Bytecode contains error: " + err);
     }
     
-    // Bypass version check since the official compiler uses v255 (which maps to v6)
-    if (chunk.version == 255) chunk.version = 6;
-    else if (chunk.version > 6) {
-        // Non-standard streams sometimes encode flags in high bits.
-        uint8_t coerced = chunk.version & 7;
-        if (coerced == 0) coerced = 3;
-        fprintf(stderr, "[*] Coerced non-standard bytecode version %u -> %u\n",
-            (unsigned)chunk.version, (unsigned)coerced);
-        chunk.version = coerced;
-        tolerantMode = true;
+    // Roblox runtime bytecode can be newer than the public Luau bytecode
+    // version published with the bundled compiler. The serialized layout for
+    // version 9 still follows the v4+ header/type-info shape; coercing it down
+    // corrupts parsing by skipping the type-version byte.
+    if (chunk.version == 255) {
+        chunk.version = 6;
+    } else if (chunk.version < 1 || chunk.version > 9) {
+        throw std::runtime_error("Unsupported bytecode version: " + std::to_string(rawVersion));
     }
+    tolerantMode = rawVersion >= 7;
 
     fprintf(stderr, "[*] Bytecode version: %d\n", chunk.version);
 
@@ -332,10 +392,11 @@ Chunk deserialize(const uint8_t* data, size_t size) {
     }
 
     // Functions
-    int funcCount = r.readVarInt();
+    int funcCount = readBoundedVarInt(r, remainingBytes(r), "function");
     fprintf(stderr, "[*] Loading %d functions\n", funcCount);
     chunk.functions.reserve(funcCount);
     for (int i = 0; i < funcCount; i++) {
+        size_t functionStart = r.position();
         try {
             Function f = readFunction(r, chunk.strings, chunk.version, chunk.typesVersion);
             f.id = i;
@@ -344,7 +405,8 @@ Chunk deserialize(const uint8_t* data, size_t size) {
             if (!tolerantMode) {
                 throw;
             }
-            fprintf(stderr, "[*] Tolerant stop while reading function %d/%d: %s\n", i, funcCount, ex.what());
+            fprintf(stderr, "[*] Tolerant stop while reading function %d/%d at offset %zu -> %zu: %s\n",
+                    i, funcCount, functionStart, r.position(), ex.what());
             break;
         }
     }

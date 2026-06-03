@@ -5,6 +5,7 @@
 #include "ir.hpp"
 #include "analysis.hpp"
 #include "structurer.hpp"
+#include "codegen.hpp"
 #include <fstream>
 #include <iostream>
 #include <optional>
@@ -92,12 +93,30 @@ int main(int argc, char* argv[]) {
     bool irMode = false;
     bool ssaMode = false;
     bool astMode = false;
+    bool legacyMode = false;
     bool strictStructuredMode = false;
     const char* inputPath = nullptr;
     const char* outputPath = nullptr;
 
+    auto printUsage = []() {
+        fprintf(stderr, "Luau Decompiler v2.1.0\n");
+        fprintf(stderr, "Usage: luau_decompiler [--raw|--cfg|--ir|--ssa|--ast|--legacy|--strict-structured] <file.luac> [output.lua]\n");
+        fprintf(stderr, "  --raw       Output raw disassembly instead of pseudo-code\n");
+        fprintf(stderr, "  --cfg       Output control-flow graph dump\n");
+        fprintf(stderr, "  --ir        Output normalized instruction IR dump\n");
+        fprintf(stderr, "  --ssa       Output analyzed SSA dump\n");
+        fprintf(stderr, "  --ast       Output structured AST dump\n");
+        fprintf(stderr, "  --legacy    Output legacy full pseudo-code emitter output\n");
+        fprintf(stderr, "  --strict-structured  Fail if structured output still contains low-level placeholders\n");
+        fprintf(stderr, "  Default mode: auto-detect opcodes and generate readable Lua\n");
+    };
+
     for (int i = 1; i < argc; i++) {
-        if (strcmp(argv[i], "--raw") == 0 || strcmp(argv[i], "-r") == 0)
+        if (strcmp(argv[i], "--help") == 0 || strcmp(argv[i], "-h") == 0) {
+            printUsage();
+            return 0;
+        }
+        else if (strcmp(argv[i], "--raw") == 0 || strcmp(argv[i], "-r") == 0)
             rawMode = true;
         else if (strcmp(argv[i], "--cfg") == 0 || strcmp(argv[i], "-g") == 0)
             cfgMode = true;
@@ -107,6 +126,8 @@ int main(int argc, char* argv[]) {
             ssaMode = true;
         else if (strcmp(argv[i], "--ast") == 0)
             astMode = true;
+        else if (strcmp(argv[i], "--legacy") == 0)
+            legacyMode = true;
         else if (strcmp(argv[i], "--strict-structured") == 0)
             strictStructuredMode = true;
         else if (!inputPath)
@@ -116,15 +137,7 @@ int main(int argc, char* argv[]) {
     }
 
     if (!inputPath) {
-        fprintf(stderr, "Luau Decompiler v2.0\n");
-        fprintf(stderr, "Usage: luau_decompiler [--raw|--cfg|--ir|--ssa|--ast|--strict-structured] <file.luac> [output.lua]\n");
-        fprintf(stderr, "  --raw       Output raw disassembly instead of pseudo-code\n");
-        fprintf(stderr, "  --cfg       Output control-flow graph dump\n");
-        fprintf(stderr, "  --ir        Output normalized instruction IR dump\n");
-        fprintf(stderr, "  --ssa       Output analyzed SSA dump\n");
-        fprintf(stderr, "  --ast       Output structured AST dump\n");
-        fprintf(stderr, "  --strict-structured  Fail if structured output still contains low-level placeholders\n");
-        fprintf(stderr, "  Default mode: auto-detect opcodes and generate readable Lua\n");
+        printUsage();
         return 1;
     }
 
@@ -185,6 +198,12 @@ int main(int argc, char* argv[]) {
 
             fprintf(stderr, "[*] Building control-flow graph...\n");
             output = formatControlFlowGraph(chunk, opmap);
+        } else if (legacyMode) {
+            fprintf(stderr, "[*] Auto-detecting opcode mapping for legacy pseudo-code...\n");
+            OpcodeMap opmap = autoDetectOpcodes(chunk);
+
+            fprintf(stderr, "[*] Generating legacy pseudo-code (%d opcodes mapped)...\n", opmap.totalMapped);
+            output = generateCode(chunk, opmap);
         } else {
             fprintf(stderr, "[*] Auto-detecting opcode mapping...\n");
             OpcodeMap opmap = autoDetectOpcodes(chunk);

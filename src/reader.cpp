@@ -1,5 +1,6 @@
 #include "reader.hpp"
 #include <cstring>
+#include <string>
 
 BytecodeReader::BytecodeReader(const uint8_t* data, size_t size)
     : data_(data), size_(size), pos_(0) {}
@@ -47,18 +48,21 @@ double BytecodeReader::readDouble() {
 
 // Luau varint: 7 bits per byte, MSB = continuation
 int32_t BytecodeReader::readVarInt() {
+    size_t start = pos_;
     uint32_t result = 0;
     int shift = 0;
-    uint8_t byte;
-    do {
-        byte = readByte();
+    for (int i = 0; i < 5; ++i) {
+        uint8_t byte = readByte();
         result |= (uint32_t)(byte & 0x7F) << shift;
+        if (!(byte & 0x80))
+            return (int32_t)result;
         shift += 7;
-    } while (byte & 0x80);
-    return (int32_t)result;
+    }
+    throw std::runtime_error("Malformed varint in bytecode at offset " + std::to_string(start));
 }
 
 std::string BytecodeReader::readString(int len) {
+    if (len < 0) throw std::runtime_error("Negative string length in bytecode");
     if (pos_ + len > size_) throw std::runtime_error("Unexpected end of bytecode");
     std::string s((const char*)(data_ + pos_), len);
     pos_ += len;
@@ -70,6 +74,12 @@ void BytecodeReader::skip(size_t n) {
     pos_ += n;
 }
 
+void BytecodeReader::seek(size_t pos) {
+    if (pos > size_) throw std::runtime_error("Bytecode seek out of range");
+    pos_ = pos;
+}
+
 const uint8_t* BytecodeReader::rawAt(size_t offset) const {
+    if (offset > size_) throw std::runtime_error("Bytecode raw offset out of range");
     return data_ + offset;
 }

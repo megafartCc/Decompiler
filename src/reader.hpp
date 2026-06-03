@@ -22,6 +22,7 @@ public:
     size_t   size()     const { return size_; }
     bool     eof()      const { return pos_ >= size_; }
     void     skip(size_t n);
+    void     seek(size_t pos);
     const uint8_t* rawAt(size_t offset) const;
 
 private:

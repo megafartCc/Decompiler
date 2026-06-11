@@ -4,7 +4,8 @@
 #include <string>
 #include <vector>
 
-void inferNames(SSAFunction& function, const Function& sourceFunction, const std::vector<std::string>& upvalueAliases = {});
+void inferNames(SSAFunction& function, const Chunk& chunk, const Function& sourceFunction,
+                const std::vector<std::string>& upvalueAliases = {});
 void detectSemanticPatterns(SSAFunction& function);
 void propagateConstants(SSAFunction& function, const Function& sourceFunction);
 void eliminateDeadCode(SSAFunction& function);

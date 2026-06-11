@@ -99,7 +99,7 @@ int main(int argc, char* argv[]) {
     const char* outputPath = nullptr;
 
     auto printUsage = []() {
-        fprintf(stderr, "Luau Decompiler v2.2.0\n");
+        fprintf(stderr, "Luau Decompiler v2.3.0\n");
         fprintf(stderr, "Usage: luau_decompiler [--raw|--cfg|--ir|--ssa|--ast|--legacy|--strict-structured] <file.luac> [output.lua]\n");
         fprintf(stderr, "  --raw       Output raw disassembly instead of pseudo-code\n");
         fprintf(stderr, "  --cfg       Output control-flow graph dump\n");

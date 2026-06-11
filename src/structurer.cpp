@@ -59,7 +59,8 @@ static std::atomic<bool> g_inlineClosureBodies{true};
 
 static AstFunction structureFunctionWithAliases(const Chunk& chunk, const Function& sourceFunction, const OpcodeMap& opmap,
                                                 const std::vector<std::string>& upvalueAliases,
-                                                const std::unordered_map<int, std::vector<std::string>>& aliasesByFunction);
+                                                const std::unordered_map<int, std::vector<std::string>>& aliasesByFunction,
+                                                const std::vector<std::string>* functionDisplayNames = nullptr);
 
 struct TableEntry {
     std::optional<std::string> namedKey;
@@ -84,6 +85,7 @@ struct ExpressionContext {
     const SSAFunction& analyzed;
     std::vector<std::string> upvalueAliases;
     const std::unordered_map<int, std::vector<std::string>>* aliasesByFunction = nullptr;
+    const std::vector<std::string>* functionDisplayNames = nullptr;
     std::unordered_map<int, TableConstruction> tables;
     std::unordered_map<int, const PhiNode*> phiByResult;
     std::unordered_set<int> symbolicPhiValues;
@@ -128,6 +130,50 @@ static bool isUsableFunctionName(const std::string& name) {
 
 static std::string canonicalProtoName(const Function& function) {
     return "proto_" + std::to_string(function.id);
+}
+
+static std::string fallbackDisplayFunctionName(const Function& function) {
+    return "fn_" + std::to_string(function.id);
+}
+
+static std::vector<std::string> buildFunctionDisplayNames(const Chunk& chunk) {
+    std::vector<std::string> names(chunk.functions.size());
+    std::vector<std::string> bases(chunk.functions.size());
+    std::unordered_map<std::string, int> baseCounts;
+
+    for (const auto& function : chunk.functions) {
+        if (function.id < 0 || function.id >= (int)chunk.functions.size()) {
+            continue;
+        }
+        if (isUsableFunctionName(function.debugName)) {
+            std::string base = sanitizeLuaIdentifier(function.debugName, "fn");
+            bases[function.id] = base;
+            baseCounts[base]++;
+        }
+    }
+
+    for (const auto& function : chunk.functions) {
+        if (function.id < 0 || function.id >= (int)chunk.functions.size()) {
+            continue;
+        }
+        const std::string& base = bases[function.id];
+        if (base.empty()) {
+            names[function.id] = fallbackDisplayFunctionName(function);
+        } else if (baseCounts[base] > 1) {
+            names[function.id] = base + "_" + std::to_string(function.id);
+        } else {
+            names[function.id] = base;
+        }
+    }
+
+    return names;
+}
+
+static std::string displayNameForFunction(const std::vector<std::string>& names, const Function& function) {
+    if (function.id >= 0 && function.id < (int)names.size() && !names[function.id].empty()) {
+        return names[function.id];
+    }
+    return fallbackDisplayFunctionName(function);
 }
 
 static std::string normalizeLiteral(const std::string& value) {
@@ -430,7 +476,9 @@ static bool isRegisterLikeAlias(const std::string& alias);
 static bool isSyntheticParameterAlias(const std::string& alias);
 static bool hasNumericSuffix(const std::string& alias);
 static std::string stripNumericSuffix(std::string alias);
+static bool isGenericSemanticAlias(const std::string& alias);
 static int aliasQuality(const std::string& alias, float confidence = 0.0f);
+static bool shouldPreferAlias(const std::string& candidate, const std::string& current);
 static void initializeSlotAliases(ExpressionContext& context);
 static std::string slotAliasFor(ExpressionContext& context, int slot);
 static std::string normalizeStructuredAlias(ExpressionContext& context, int slot, std::string alias);
@@ -1009,6 +1057,9 @@ static std::vector<std::string> collectClosureCaptureAliases(ExpressionContext& 
         if (value.rfind("upval", 0) == 0 || value.rfind("capture", 0) == 0) {
             return true;
         }
+        if (isGenericSemanticAlias(value)) {
+            return true;
+        }
         if (value.size() > 1 && value[0] == 'v' && std::isdigit((unsigned char)value[1])) {
             for (size_t i = 2; i < value.size(); ++i) {
                 if (!std::isdigit((unsigned char)value[i]) && value[i] != '_') {
@@ -1100,7 +1151,7 @@ static std::vector<std::string> resolveClosureCaptureAliases(ExpressionContext& 
         if (candidate.empty()) {
             continue;
         }
-        if (aliases[i].empty() || aliasQuality(candidate) > aliasQuality(aliases[i])) {
+        if (shouldPreferAlias(candidate, aliases[i])) {
             aliases[i] = candidate;
         }
     }
@@ -1382,12 +1433,15 @@ static std::string renderClosureExpression(ExpressionContext& context, const SSA
         return context.analyzed.values[instruction.defs.front()].name;
     }
     if (!g_inlineClosureBodies.load(std::memory_order_relaxed)) {
-        return canonicalProtoName(**childFunction);
+        return context.functionDisplayNames
+            ? displayNameForFunction(*context.functionDisplayNames, **childFunction)
+            : canonicalProtoName(**childFunction);
     }
 
     std::vector<std::string> captureAliases = resolveClosureCaptureAliases(context, instruction, **childFunction);
     AstFunction childAst = context.aliasesByFunction
-        ? structureFunctionWithAliases(context.chunk, **childFunction, context.opmap, captureAliases, *context.aliasesByFunction)
+        ? structureFunctionWithAliases(context.chunk, **childFunction, context.opmap, captureAliases,
+                                       *context.aliasesByFunction, context.functionDisplayNames)
         : structureFunction(context.chunk, **childFunction, context.opmap, captureAliases);
     std::string anonymous = formatAnonymousAstFunction(childAst, depth + 1);
     anonymous = trimTrailingNewline(anonymous);
@@ -1403,7 +1457,8 @@ static std::optional<AstFunction> buildClosureAst(ExpressionContext& context, co
 
     std::vector<std::string> captureAliases = resolveClosureCaptureAliases(context, instruction, **childFunction);
     if (context.aliasesByFunction) {
-        return structureFunctionWithAliases(context.chunk, **childFunction, context.opmap, captureAliases, *context.aliasesByFunction);
+        return structureFunctionWithAliases(context.chunk, **childFunction, context.opmap, captureAliases,
+                                           *context.aliasesByFunction, context.functionDisplayNames);
     }
     return structureFunction(context.chunk, **childFunction, context.opmap, captureAliases);
 }
@@ -1529,6 +1584,25 @@ static int aliasQuality(const std::string& alias, float confidence) {
     score -= (int)alias.size() / 8;
     score += (int)(std::clamp(confidence, 0.0f, 1.0f) * 45.0f);
     return score;
+}
+
+static bool shouldPreferAlias(const std::string& candidate, const std::string& current) {
+    if (candidate.empty()) {
+        return false;
+    }
+    if (current.empty()) {
+        return true;
+    }
+
+    const bool candidateGeneric = isWeakAlias(candidate) || isGenericSemanticAlias(candidate);
+    const bool currentGeneric = isWeakAlias(current) || isGenericSemanticAlias(current);
+    if (!candidateGeneric && currentGeneric) {
+        return true;
+    }
+    if (candidateGeneric && !currentGeneric) {
+        return false;
+    }
+    return aliasQuality(candidate) > aliasQuality(current);
 }
 
 static void initializeSlotAliases(ExpressionContext& context) {
@@ -1661,13 +1735,26 @@ static std::string assignmentTargetForValue(ExpressionContext& context, int valu
 }
 
 static std::string upvalueAliasFor(ExpressionContext& context, int upvalueIndex) {
-    if (upvalueIndex >= 0 && upvalueIndex < (int)context.upvalueAliases.size() &&
-        !context.upvalueAliases[upvalueIndex].empty()) {
-        return sanitizeLuaIdentifier(context.upvalueAliases[upvalueIndex], "upval");
+    std::string inherited;
+    if (upvalueIndex >= 0 && upvalueIndex < (int)context.upvalueAliases.size()) {
+        inherited = normalizeInheritedAlias(context.upvalueAliases[upvalueIndex]);
     }
+
+    std::string declared;
     if (upvalueIndex >= 0 && upvalueIndex < (int)context.sourceFunction.upvalueNames.size() &&
         !context.sourceFunction.upvalueNames[upvalueIndex].empty()) {
-        return normalizeUpvalueAliasName(context.sourceFunction.upvalueNames[upvalueIndex]);
+        declared = normalizeUpvalueAliasName(context.sourceFunction.upvalueNames[upvalueIndex]);
+    }
+
+    if (!declared.empty() && shouldPreferAlias(declared, inherited)) {
+        return declared;
+    }
+    if (declared.empty() && !inherited.empty() && isGenericSemanticAlias(inherited) &&
+        context.sourceFunction.debugName.rfind("__", 0) == 0) {
+        return "handler";
+    }
+    if (!inherited.empty()) {
+        return sanitizeLuaIdentifier(inherited, "upval");
     }
     return "upval" + std::to_string(upvalueIndex);
 }
@@ -1980,7 +2067,10 @@ static std::optional<std::string> renderNamedClosureDefinition(ExpressionContext
         return std::nullopt;
     }
     if (!g_inlineClosureBodies.load(std::memory_order_relaxed)) {
-        return qualifiedName + " = " + canonicalProtoName(**childFunction);
+        std::string functionName = context.functionDisplayNames
+            ? displayNameForFunction(*context.functionDisplayNames, **childFunction)
+            : canonicalProtoName(**childFunction);
+        return qualifiedName + " = " + functionName;
     }
 
     auto childAst = buildClosureAst(context, *closureInstruction);
@@ -4024,11 +4114,13 @@ static AstFunction fallbackFunctionToLegacyBody(const Chunk& chunk, const Functi
 
 static AstFunction structureFunctionWithPolicy(const Chunk& chunk, const Function& sourceFunction, const OpcodeMap& opmap,
                                                const std::vector<std::string>& upvalueAliases,
-                                               const std::unordered_map<int, std::vector<std::string>>* aliasesByFunction) {
+                                               const std::unordered_map<int, std::vector<std::string>>* aliasesByFunction,
+                                               const std::vector<std::string>* functionDisplayNames = nullptr) {
     try {
         SSAFunction analyzed = analyzeFunction(chunk, sourceFunction, opmap, upvalueAliases);
         ExpressionContext context{chunk, sourceFunction, opmap, analyzed, upvalueAliases};
         context.aliasesByFunction = aliasesByFunction;
+        context.functionDisplayNames = functionDisplayNames;
         initializeSlotAliases(context);
         populatePhiMap(context);
         markSymbolicLoopPhiValues(context);
@@ -4066,14 +4158,16 @@ static AstFunction structureFunctionWithPolicy(const Chunk& chunk, const Functio
 
 static AstFunction structureFunctionWithAliases(const Chunk& chunk, const Function& sourceFunction, const OpcodeMap& opmap,
                                                 const std::vector<std::string>& upvalueAliases,
-                                                const std::unordered_map<int, std::vector<std::string>>& aliasesByFunction) {
-    return structureFunctionWithPolicy(chunk, sourceFunction, opmap, upvalueAliases, &aliasesByFunction);
+                                                const std::unordered_map<int, std::vector<std::string>>& aliasesByFunction,
+                                                const std::vector<std::string>* functionDisplayNames) {
+    return structureFunctionWithPolicy(chunk, sourceFunction, opmap, upvalueAliases, &aliasesByFunction,
+                                       functionDisplayNames);
 }
 } // namespace
 
 AstFunction structureFunction(const Chunk& chunk, const Function& sourceFunction, const OpcodeMap& opmap,
                               const std::vector<std::string>& upvalueAliases) {
-    return structureFunctionWithPolicy(chunk, sourceFunction, opmap, upvalueAliases, nullptr);
+    return structureFunctionWithPolicy(chunk, sourceFunction, opmap, upvalueAliases, nullptr, nullptr);
 }
 
 AstFunction structureMainFunction(const Chunk& chunk, const OpcodeMap& opmap) {
@@ -4083,7 +4177,7 @@ AstFunction structureMainFunction(const Chunk& chunk, const OpcodeMap& opmap) {
 
     std::unordered_map<int, std::vector<std::string>> aliasesByFunction;
     collectStructuredAliasesRecursive(chunk, chunk.functions[chunk.mainIndex], opmap, {}, aliasesByFunction);
-    return structureFunctionWithAliases(chunk, chunk.functions[chunk.mainIndex], opmap, {}, aliasesByFunction);
+    return structureFunctionWithAliases(chunk, chunk.functions[chunk.mainIndex], opmap, {}, aliasesByFunction, nullptr);
 }
 
 std::string formatStructuredSource(const Chunk& chunk, const OpcodeMap& opmap) {
@@ -4116,6 +4210,7 @@ std::string formatStructuredSource(const Chunk& chunk, const OpcodeMap& opmap) {
     if (chunk.mainIndex >= 0 && chunk.mainIndex < (int)chunk.functions.size()) {
         collectStructuredAliasesRecursive(chunk, chunk.functions[chunk.mainIndex], opmap, {}, aliasesByFunction);
     }
+    std::vector<std::string> displayNames = buildFunctionDisplayNames(chunk);
 
     auto functionChunks = formatFunctionsParallel(chunk.functions, [&](const Function& function) {
         if (function.id == chunk.mainIndex) {
@@ -4128,14 +4223,12 @@ std::string formatStructuredSource(const Chunk& chunk, const OpcodeMap& opmap) {
             function,
             opmap,
             aliasIt != aliasesByFunction.end() ? aliasIt->second : std::vector<std::string>{},
-            aliasesByFunction
+            aliasesByFunction,
+            &displayNames
         );
-        ast.name = canonicalProtoName(function);
+        ast.name = displayNameForFunction(displayNames, function);
 
         std::ostringstream chunkOut;
-        if (!function.debugName.empty()) {
-            chunkOut << "-- debug name: " << function.debugName << "\n";
-        }
         chunkOut << formatAstFunction(ast) << "\n";
         return chunkOut.str();
     });
@@ -4148,13 +4241,15 @@ std::string formatStructuredSource(const Chunk& chunk, const OpcodeMap& opmap) {
         }
     }
     if (emittedFunction) {
-        out << "-- Main entry body: proto_" << chunk.mainIndex << "\n";
+        out << "-- Main entry body: "
+            << displayNameForFunction(displayNames, chunk.functions[chunk.mainIndex]) << "\n";
     }
 
     std::string body;
     if (chunk.mainIndex >= 0 && chunk.mainIndex < (int)chunk.functions.size()) {
-        AstFunction mainAst = structureFunctionWithAliases(chunk, chunk.functions[chunk.mainIndex], opmap, {}, aliasesByFunction);
-        mainAst.name = canonicalProtoName(chunk.functions[chunk.mainIndex]);
+        AstFunction mainAst = structureFunctionWithAliases(chunk, chunk.functions[chunk.mainIndex], opmap, {},
+                                                           aliasesByFunction, &displayNames);
+        mainAst.name = displayNameForFunction(displayNames, chunk.functions[chunk.mainIndex]);
         body = formatAstChunk(mainAst);
         out << body;
         if (!body.empty() && body.back() != '\n') {
@@ -4184,6 +4279,7 @@ std::string formatStructuredAst(const Chunk& chunk, const OpcodeMap& opmap) {
     if (chunk.mainIndex >= 0 && chunk.mainIndex < (int)chunk.functions.size()) {
         collectStructuredAliasesRecursive(chunk, chunk.functions[chunk.mainIndex], opmap, {}, aliasesByFunction);
     }
+    std::vector<std::string> displayNames = buildFunctionDisplayNames(chunk);
 
     auto chunks = formatFunctionsParallel(chunk.functions, [&](const Function& function) {
         auto aliasIt = aliasesByFunction.find(function.id);
@@ -4192,9 +4288,10 @@ std::string formatStructuredAst(const Chunk& chunk, const OpcodeMap& opmap) {
             function,
             opmap,
             aliasIt != aliasesByFunction.end() ? aliasIt->second : std::vector<std::string>{},
-            aliasesByFunction
+            aliasesByFunction,
+            &displayNames
         );
-        ast.name = canonicalProtoName(function);
+        ast.name = displayNameForFunction(displayNames, function);
         return formatAstFunction(ast) + "\n";
     });
 

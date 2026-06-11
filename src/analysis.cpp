@@ -118,6 +118,97 @@ static std::string canonicalizeTempName(std::string name) {
     return name;
 }
 
+static bool isGenericRecoveredName(const std::string& name) {
+    if (name.empty() || name == "_") {
+        return true;
+    }
+    static const std::unordered_set<std::string> kGenericNames = {
+        "closure", "result", "value", "item", "entry", "condition",
+        "count", "flag", "index", "table", "merge", "text", "formatted"
+    };
+    if (kGenericNames.count(name) != 0) {
+        return true;
+    }
+    if (name.rfind("upval", 0) == 0 || name.rfind("capture", 0) == 0 ||
+        name.rfind("result_", 0) == 0 || name.rfind("value_", 0) == 0 ||
+        name.rfind("count_", 0) == 0) {
+        return true;
+    }
+    if (isVersionedTempName(name, 'v') || isVersionedTempName(name, 'p')) {
+        return true;
+    }
+    return false;
+}
+
+static std::string bestUpvalueBaseName(const Function& sourceFunction,
+                                       const std::vector<std::string>& upvalueAliases,
+                                       int upvalueIndex,
+                                       float* confidence = nullptr) {
+    std::string inherited;
+    if (upvalueIndex >= 0 && upvalueIndex < (int)upvalueAliases.size()) {
+        if (!upvalueAliases[upvalueIndex].empty()) {
+            inherited = sanitizeLuaIdentifier(upvalueAliases[upvalueIndex], "upval");
+        }
+    }
+
+    std::string declared;
+    if (upvalueIndex >= 0 && upvalueIndex < (int)sourceFunction.upvalueNames.size()) {
+        if (!sourceFunction.upvalueNames[upvalueIndex].empty()) {
+            declared = sanitizeLuaIdentifier(sourceFunction.upvalueNames[upvalueIndex], "upval");
+        }
+    }
+
+    if (!declared.empty() && (inherited.empty() || isGenericRecoveredName(inherited))) {
+        if (confidence) {
+            *confidence = 0.9f;
+        }
+        return declared;
+    }
+    if (!inherited.empty()) {
+        if (confidence) {
+            *confidence = isGenericRecoveredName(inherited) ? 0.55f : 0.96f;
+        }
+        return inherited;
+    }
+    if (!declared.empty()) {
+        if (confidence) {
+            *confidence = 0.9f;
+        }
+        return declared;
+    }
+    if (confidence) {
+        *confidence = 0.45f;
+    }
+    return "upval" + std::to_string(upvalueIndex);
+}
+
+static std::optional<std::string> childClosureDebugName(const Chunk& chunk,
+                                                        const Function& sourceFunction,
+                                                        const DecodedInstruction& instruction) {
+    int protoIndex = -1;
+
+    if (instruction.stdOp == OP_NEWCLOSURE) {
+        if (instruction.d >= 0 && instruction.d < (int)sourceFunction.childProtos.size()) {
+            protoIndex = sourceFunction.childProtos[instruction.d];
+        }
+    } else if (instruction.stdOp == OP_DUPCLOSURE) {
+        if (instruction.d >= 0 && instruction.d < (int)sourceFunction.constants.size() &&
+            sourceFunction.constants[instruction.d].type == ConstantType::Closure) {
+            protoIndex = sourceFunction.constants[instruction.d].closureIdx;
+        }
+    }
+
+    if (protoIndex < 0 || protoIndex >= (int)chunk.functions.size()) {
+        return std::nullopt;
+    }
+
+    const std::string& debugName = chunk.functions[protoIndex].debugName;
+    if (debugName.empty() || !isLuaIdentifier(debugName)) {
+        return std::nullopt;
+    }
+    return sanitizeLuaIdentifier(debugName, "fn");
+}
+
 static std::string valueText(const SSAFunction& function, int valueId) {
     const auto& value = function.values[valueId];
     if (value.constantValue.has_value()) {
@@ -1104,7 +1195,8 @@ static std::string inferUsageDrivenBaseName(const SSAFunction& function, int val
 }
 } // namespace
 
-void inferNames(SSAFunction& function, const Function& sourceFunction, const std::vector<std::string>& upvalueAliases) {
+void inferNames(SSAFunction& function, const Chunk& chunk, const Function& sourceFunction,
+                const std::vector<std::string>& upvalueAliases) {
     std::unordered_map<std::string, int> usedNames;
 
     for (auto& value : function.values) {
@@ -1126,19 +1218,9 @@ void inferNames(SSAFunction& function, const Function& sourceFunction, const std
             continue;
         }
         if (value.isUpvalue) {
-            std::string base;
-            float confidence = 0.55f;
             int upvalueIndex = value.upvalueIndex;
-            if (upvalueIndex >= 0 && upvalueIndex < (int)upvalueAliases.size() && !upvalueAliases[upvalueIndex].empty()) {
-                base = upvalueAliases[upvalueIndex];
-                confidence = 0.96f;
-            } else if (upvalueIndex >= 0 && upvalueIndex < (int)sourceFunction.upvalueNames.size() && !sourceFunction.upvalueNames[upvalueIndex].empty()) {
-                base = sourceFunction.upvalueNames[upvalueIndex];
-                confidence = 0.9f;
-            } else {
-                base = "upval" + std::to_string(upvalueIndex);
-                confidence = 0.45f;
-            }
+            float confidence = 0.55f;
+            std::string base = bestUpvalueBaseName(sourceFunction, upvalueAliases, upvalueIndex, &confidence);
             if (base.rfind("upval", 0) == 0) {
                 std::string usageBase = inferUsageDrivenBaseName(function, value.id);
                 if (!usageBase.empty()) {
@@ -1170,16 +1252,9 @@ void inferNames(SSAFunction& function, const Function& sourceFunction, const std
         if (def) {
             if (def->inst.stdOp == OP_GETUPVAL) {
                 int upvalueIndex = def->inst.b;
-                if (upvalueIndex >= 0 && upvalueIndex < (int)upvalueAliases.size() && !upvalueAliases[upvalueIndex].empty()) {
-                    base = upvalueAliases[upvalueIndex];
-                    confidence = std::max(confidence, 0.95f);
-                } else if (upvalueIndex >= 0 && upvalueIndex < (int)sourceFunction.upvalueNames.size() && !sourceFunction.upvalueNames[upvalueIndex].empty()) {
-                    base = sourceFunction.upvalueNames[upvalueIndex];
-                    confidence = std::max(confidence, 0.88f);
-                } else {
-                    base = "upval" + std::to_string(upvalueIndex);
-                    confidence = std::max(confidence, 0.46f);
-                }
+                float upvalueConfidence = 0.46f;
+                base = bestUpvalueBaseName(sourceFunction, upvalueAliases, upvalueIndex, &upvalueConfidence);
+                confidence = std::max(confidence, upvalueConfidence);
             } else if (def->inst.stdOp == OP_NAMECALL && def->inst.keyName.has_value()) {
                 std::string methodBase = toIdentifier(*def->inst.keyName);
                 if (!def->defs.empty() && value.id == def->defs.front()) {
@@ -1215,7 +1290,12 @@ void inferNames(SSAFunction& function, const Function& sourceFunction, const std
                     confidence = std::max(confidence, 0.69f);
                 }
             } else if (def->inst.stdOp == OP_NEWCLOSURE || def->inst.stdOp == OP_DUPCLOSURE) {
-                base = inferAssignedFieldName(function, value.id);
+                if (auto childName = childClosureDebugName(chunk, sourceFunction, def->inst); childName.has_value()) {
+                    base = *childName;
+                    confidence = std::max(confidence, 0.9f);
+                } else {
+                    base = inferAssignedFieldName(function, value.id);
+                }
                 if (base.empty()) {
                     base = "closure";
                     confidence = std::max(confidence, 0.5f);
@@ -1342,6 +1422,18 @@ void inferNames(SSAFunction& function, const Function& sourceFunction, const std
                         } else if (importName == "tostring" && def->uses.size() >= 2) {
                             base = inferTostringBase(function, def->uses[1]);
                             confidence = std::max(confidence, 0.73f);
+                        }
+                    } else if (calleeDef && calleeDef->inst.stdOp == OP_GETUPVAL) {
+                        float upvalueConfidence = 0.0f;
+                        std::string calleeName = bestUpvalueBaseName(
+                            sourceFunction,
+                            upvalueAliases,
+                            calleeDef->inst.b,
+                            &upvalueConfidence
+                        );
+                        if (!isGenericRecoveredName(calleeName) && calleeName.rfind("upval", 0) != 0) {
+                            base = toIdentifier(calleeName) + "Result";
+                            confidence = std::max(confidence, std::min(0.74f, upvalueConfidence));
                         }
                     }
                 }
@@ -1689,7 +1781,7 @@ SSAFunction analyzeFunction(const Chunk& chunk, const Function& function, const 
         }
         propagateConstants(analyzed, function);
     }
-    inferNames(analyzed, function, upvalueAliases);
+    inferNames(analyzed, chunk, function, upvalueAliases);
     detectSemanticPatterns(analyzed);
     eliminateDeadCode(analyzed);
     recomputeUseCounts(analyzed);

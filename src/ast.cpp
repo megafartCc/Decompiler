@@ -289,6 +289,37 @@ static bool isBareBreak(const AstStatement& statement) {
     return statement.kind == AstStatementKind::Raw && trimWhitespace(statement.text) == "break";
 }
 
+static bool startsWithLuaKeyword(const std::string& text, const std::string& keyword) {
+    if (text.rfind(keyword, 0) != 0) {
+        return false;
+    }
+    if (text.size() == keyword.size()) {
+        return true;
+    }
+    unsigned char next = (unsigned char)text[keyword.size()];
+    return std::isspace(next) != 0;
+}
+
+static bool isTerminalRawStatement(const AstStatement& statement) {
+    if (statement.kind != AstStatementKind::Raw) {
+        return false;
+    }
+
+    std::string text = trimWhitespace(statement.text);
+    if (text.empty()) {
+        return false;
+    }
+
+    size_t firstLineEnd = text.find('\n');
+    std::string firstLine = firstLineEnd == std::string::npos
+        ? text
+        : trimWhitespace(text.substr(0, firstLineEnd));
+
+    return startsWithLuaKeyword(firstLine, "return") ||
+           startsWithLuaKeyword(firstLine, "break") ||
+           startsWithLuaKeyword(firstLine, "continue");
+}
+
 static bool isSimpleBreakIf(const AstStatement& statement, std::string& condition) {
     if (statement.kind != AstStatementKind::If || !statement.elseBody.empty() || statement.body.size() != 1 ||
         !isBareBreak(statement.body.front())) {
@@ -1362,7 +1393,7 @@ static void renderStatement(std::ostringstream& out, const AstStatement& stateme
                     } else if (trimmed.rfind("(function", 0) == 0) {
                         out << ind << "local _ = " << line << "\n";
                     } else {
-                        out << ind << line << "\n";
+                        out << ind << "do end; " << trimmed << "\n";
                     }
                 } else {
                     out << ind << line << "\n";
@@ -1387,10 +1418,16 @@ static void renderStatement(std::ostringstream& out, const AstStatement& stateme
                     folded.kind = AstStatementKind::Raw;
                     folded.text = replacement;
                     renderStatement(out, folded, level);
+                    if (isTerminalRawStatement(folded)) {
+                        break;
+                    }
                     ++i;
                     continue;
                 }
                 renderStatement(out, statement.body[i], level);
+                if (isTerminalRawStatement(statement.body[i])) {
+                    break;
+                }
             }
             break;
         case AstStatementKind::Raw:
@@ -1403,6 +1440,9 @@ static void renderStatement(std::ostringstream& out, const AstStatement& stateme
             out << ind << statement.header << "\n";
             for (const auto& child : statement.body) {
                 renderStatement(out, child, level + 1);
+                if (isTerminalRawStatement(child)) {
+                    break;
+                }
             }
             if (!statement.footer.empty()) {
                 out << ind << statement.footer << "\n";
@@ -1418,6 +1458,9 @@ static void renderIfStatement(std::ostringstream& out, const AstStatement& state
     out << ind << "if " << statement.header << " then\n";
     for (const auto& child : statement.body) {
         renderStatement(out, child, level + 1);
+        if (isTerminalRawStatement(child)) {
+            break;
+        }
     }
 
     const AstStatement* currentElseIf = nullptr;
@@ -1427,6 +1470,9 @@ static void renderIfStatement(std::ostringstream& out, const AstStatement& state
         out << ind << "elseif " << currentElseIf->header << " then\n";
         for (const auto& child : currentElseIf->body) {
             renderStatement(out, child, level + 1);
+            if (isTerminalRawStatement(child)) {
+                break;
+            }
         }
         elseTail = &currentElseIf->elseBody;
     }
@@ -1435,6 +1481,9 @@ static void renderIfStatement(std::ostringstream& out, const AstStatement& state
         out << ind << "else\n";
         for (const auto& child : *elseTail) {
             renderStatement(out, child, level + 1);
+            if (isTerminalRawStatement(child)) {
+                break;
+            }
         }
     }
 

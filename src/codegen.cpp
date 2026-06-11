@@ -300,6 +300,27 @@ static std::string resolveReg(const RegTracker& rt, const Function& f, int slot,
     return reg(f, slot, pc, ssa);
 }
 
+static std::string resolveRegForExpression(std::ostringstream& out, RegTracker& rt,
+                                           const Function& f, int slot, int pc,
+                                           const SSATracker& ssa,
+                                           const std::string& indentStr,
+                                           bool allowLiteral = true) {
+    auto tableIt = activeTableBuffers.find(slot);
+    if (tableIt != activeTableBuffers.end() && tableIt->second.active) {
+        std::string name = reg(f, slot, pc, ssa, true);
+        out << indentStr << name << " = " << tableIt->second.formatInline(indentStr) << "\n";
+        activeTableBuffers.erase(tableIt);
+
+        RegVal rv;
+        rv.kind = RegVal::TABLE_ACCESS;
+        rv.repr = name;
+        rt.set(slot, rv);
+        return name;
+    }
+
+    return resolveReg(rt, f, slot, pc, ssa, allowLiteral, indentStr);
+}
+
 // Annotate a string table index with the actual string content (for upval_0[N] lookups)
 static std::string strAnnotation(const Chunk& chunk, int idx) {
     // String table indices are 1-based in references but 0-based in array
@@ -564,7 +585,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
             }
 
             case OP_GETTABLE: {
-                std::string expr = asIndexBaseExpr(resolveReg(rt, f, B, pc, ssa, true, ind1)) + "[" + resolveReg(rt, f, C, pc, ssa, true, ind1) + "]";
+                std::string expr = asIndexBaseExpr(resolveRegForExpression(out, rt, f, B, pc, ssa, ind1, true)) + "[" + resolveReg(rt, f, C, pc, ssa, true, ind1) + "]";
                 // INLINER: Cache as table access!
                 RegVal rv; rv.kind = RegVal::TABLE_ACCESS; rv.repr = expr; rt.set(A, rv);
                 break;
@@ -577,7 +598,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                     activeTableBuffers[B].isListOnly = false;
                     activeTableBuffers[B].entries.push_back({keyExpr, resolveReg(rt, f, A, pc, ssa, true, ind1)});
                 } else {
-                    std::string target = asIndexBaseExpr(resolveReg(rt, f, B, pc, ssa, true, ind1)) + "[" + resolveReg(rt, f, C, pc, ssa, true, ind1) + "]";
+                    std::string target = asIndexBaseExpr(resolveRegForExpression(out, rt, f, B, pc, ssa, ind1, true)) + "[" + resolveReg(rt, f, C, pc, ssa, true, ind1) + "]";
                     emitAssignment(out, ind1, target, resolveReg(rt, f, A, pc, ssa, true, ind1));
                 }
                 break;
@@ -586,7 +607,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                 uint32_t aux = f.instructions[++pc].value;
                 std::string key = unquoteSimpleStringLiteral(constStr(f, aux, chunk.strings));
                 // INLINER: Allow parsing underlying global table literals like 'game.Players' inside GETTABLEKS
-                std::string base = asIndexBaseExpr(resolveReg(rt, f, B, pc, ssa, true, ind1));
+                std::string base = asIndexBaseExpr(resolveRegForExpression(out, rt, f, B, pc, ssa, ind1, true));
                 std::string expr = isIdentifierName(key) ? (base + "." + key) : (base + "[" + constStr(f, aux, chunk.strings) + "]");
                 // INLINER: Cache as object property, block assignment printing!
                 RegVal rv; rv.kind = RegVal::TABLE_ACCESS; rv.repr = expr; rt.set(A, rv);
@@ -609,7 +630,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                     activeTableBuffers[B].isListOnly = false;
                     activeTableBuffers[B].entries.push_back({key, resolveReg(rt, f, A, pc, ssa, true, ind1)});
                 } else {
-                    std::string base = asIndexBaseExpr(resolveReg(rt, f, B, pc, ssa, true, ind1));
+                    std::string base = asIndexBaseExpr(resolveRegForExpression(out, rt, f, B, pc, ssa, ind1, true));
                     std::string target = isIdentifierName(key) ? (base + "." + key) : (base + "[" + keyLiteral + "]");
                     emitAssignment(out, ind1, target, resolveReg(rt, f, A, pc, ssa, true, ind1));
                 }
@@ -627,7 +648,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                         method = f.constants[aux].strVal;
                     }
                 }
-                std::string obj = asIndexBaseExpr(resolveReg(rt, f, B, pc, ssa, true)); // INLINER: Allow literal string lookup for Namecalls
+                std::string obj = asIndexBaseExpr(resolveRegForExpression(out, rt, f, B, pc, ssa, ind1, true)); // INLINER: Allow literal string lookup for Namecalls
                 RegVal rv1;
                 if (isIdentifierName(method)) {
                     rv1.kind = RegVal::METHOD_CALL;
@@ -642,7 +663,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
             }
 
             case OP_CALL: {
-                std::string func = resolveReg(rt, f, A, pc, ssa, true); // INLINER: Allow literal lookup for Call handles
+                std::string func = resolveRegForExpression(out, rt, f, A, pc, ssa, ind1, true); // INLINER: Allow literal lookup for Call handles
                 std::string callable = asCallableExpr(func);
                 std::string argsStr;
                 std::string firstArgLiterals; // HEURISTIC ENGINE hook
@@ -706,9 +727,7 @@ static void emitFunction(std::ostringstream& out, const Chunk& chunk, const Opco
                         if (i > 0) results += ", ";
                         results += reg(f, A + i, pc, ssa, true);
                         
-                        // Heuristic: Ensure returned Tables are flushed and formatted properly
                         if (activeTableBuffers.count(A+i)) {
-                            results += " = " + activeTableBuffers[A+i].formatInline(ind1);
                             activeTableBuffers.erase(A+i);
                         }
                     }

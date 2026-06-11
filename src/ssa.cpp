@@ -674,6 +674,7 @@ static SlotAccess analyzeSlotAccess(const Function& function, const DecodedInstr
         case OP_DIV:
         case OP_MOD:
         case OP_POW:
+        case OP_IDIV:
         case OP_AND:
         case OP_OR:
             addUnique(access.uses, inst.b);
@@ -686,6 +687,7 @@ static SlotAccess analyzeSlotAccess(const Function& function, const DecodedInstr
         case OP_DIVK:
         case OP_MODK:
         case OP_POWK:
+        case OP_IDIVK:
         case OP_ANDK:
         case OP_ORK:
         case OP_NOT:
@@ -1258,6 +1260,13 @@ std::string formatSSA(const Chunk& chunk, const OpcodeMap& opmap) {
 
     for (const auto& function : chunk.functions) {
         SSAFunction ssa = buildSSAFunction(chunk, function, opmap);
+        auto valueName = [&](int valueId) -> std::string {
+            if (valueId < 0 || valueId >= (int)ssa.values.size()) {
+                return "<invalid:" + std::to_string(valueId) + ">";
+            }
+            return ssa.values[valueId].name;
+        };
+
         out << "Function proto#" << function.id;
         if (!function.debugName.empty()) {
             out << " \"" << function.debugName << "\"";
@@ -1270,13 +1279,12 @@ std::string formatSSA(const Chunk& chunk, const OpcodeMap& opmap) {
         for (const auto& block : ssa.blocks) {
             out << "  block b" << block.blockId << "\n";
             for (const auto& phi : block.phis) {
-                const auto& result = ssa.values[phi.resultValueId];
-                out << "    phi " << result.name << " <- ";
+                out << "    phi " << valueName(phi.resultValueId) << " <- ";
                 bool first = true;
                 for (const auto& [pred, valueId] : phi.inputs) {
                     if (!first) out << ", ";
                     first = false;
-                    out << "b" << pred << ":" << ssa.values[valueId].name;
+                    out << "b" << pred << ":" << valueName(valueId);
                 }
                 out << "\n";
             }
@@ -1287,21 +1295,21 @@ std::string formatSSA(const Chunk& chunk, const OpcodeMap& opmap) {
                     out << " defs=";
                     for (size_t i = 0; i < instruction.defs.size(); ++i) {
                         if (i) out << ", ";
-                        out << ssa.values[instruction.defs[i]].name;
+                        out << valueName(instruction.defs[i]);
                     }
                 }
                 if (!instruction.uses.empty()) {
                     out << " uses=";
                     for (size_t i = 0; i < instruction.uses.size(); ++i) {
                         if (i) out << ", ";
-                        out << ssa.values[instruction.uses[i]].name;
+                        out << valueName(instruction.uses[i]);
                     }
                 }
                 if (!instruction.clobberDefs.empty()) {
                     out << " clobber=";
                     for (size_t i = 0; i < instruction.clobberDefs.size(); ++i) {
                         if (i) out << ", ";
-                        out << ssa.values[instruction.clobberDefs[i]].name;
+                        out << valueName(instruction.clobberDefs[i]);
                     }
                 }
                 out << "\n";

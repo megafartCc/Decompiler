@@ -55,6 +55,8 @@ static std::vector<std::string> formatFunctionsParallel(const std::vector<Functi
 }
 
 namespace {
+static std::atomic<bool> g_inlineClosureBodies{true};
+
 static AstFunction structureFunctionWithAliases(const Chunk& chunk, const Function& sourceFunction, const OpcodeMap& opmap,
                                                 const std::vector<std::string>& upvalueAliases,
                                                 const std::unordered_map<int, std::vector<std::string>>& aliasesByFunction);
@@ -63,7 +65,9 @@ struct TableEntry {
     std::optional<std::string> namedKey;
     std::optional<int> numericKey;
     std::optional<int> keyValueId;
+    std::optional<std::string> keyExpression;
     int valueId = -1;
+    std::optional<std::string> valueExpression;
 };
 
 struct TableConstruction {
@@ -87,6 +91,7 @@ struct ExpressionContext {
     std::unordered_set<int> capturedMutableValues;
     std::unordered_set<int> closureCapturedValues;
     std::unordered_set<int> foldedInstructions;
+    std::unordered_set<int> foldedCallExpressions;
     std::unordered_map<int, std::string> slotAliases;
     std::unordered_map<int, std::string> expressionCache;
     std::unordered_set<int> expressionStack;
@@ -119,6 +124,10 @@ static std::string localNameForSlot(const Function& function, int slot) {
 
 static bool isUsableFunctionName(const std::string& name) {
     return isLuaIdentifier(name);
+}
+
+static std::string canonicalProtoName(const Function& function) {
+    return "proto_" + std::to_string(function.id);
 }
 
 static std::string normalizeLiteral(const std::string& value) {
@@ -410,6 +419,7 @@ static int valueIdForSlot(ExpressionContext& context, const SSAInstruction& inst
 
 static std::string buildExpression(ExpressionContext& context, int valueId, int depth = 0);
 static std::string buildCallExpression(ExpressionContext& context, const SSAInstruction& instruction, int depth);
+static std::string buildArgumentExpression(ExpressionContext& context, int valueId, int depth, bool isLastArgument);
 static std::string assignmentTargetForValue(ExpressionContext& context, int valueId);
 static bool isConditionalOpcode(int stdOp);
 static bool canInlineConditionValue(ExpressionContext& context, const SSAInstruction& terminator, size_t useIndex);
@@ -663,10 +673,6 @@ static std::optional<int> choosePhiRepresentative(ExpressionContext& context, co
         }
     }
 
-    if (!loopBackPreds.empty()) {
-        return std::nullopt;
-    }
-
     auto pickInput = [&](bool preferNonLoopBack) -> std::optional<int> {
         for (int pred : context.analyzed.cfg.blocks[phi.blockId].predecessors) {
             auto it = phi.inputs.find(pred);
@@ -739,8 +745,12 @@ static std::string renderTableLiteral(ExpressionContext& context, const TableCon
                 out << "[" << *entry.numericKey << "] = ";
             } else if (entry.keyValueId.has_value()) {
                 out << "[" << buildExpression(context, *entry.keyValueId, depth + 1) << "] = ";
+            } else if (entry.keyExpression.has_value()) {
+                out << "[" << *entry.keyExpression << "] = ";
             }
-            out << buildExpression(context, entry.valueId, depth + 1);
+            out << (entry.valueExpression.has_value()
+                ? *entry.valueExpression
+                : buildExpression(context, entry.valueId, depth + 1));
             if (i + 1 < table.entries.size()) {
                 out << ",";
             }
@@ -750,6 +760,23 @@ static std::string renderTableLiteral(ExpressionContext& context, const TableCon
     }
     out << "}";
     return out.str();
+}
+
+static bool isCallInstruction(const SSAInstruction& instruction) {
+    return instruction.inst.stdOp == OP_CALL || instruction.inst.stdOp == OP_NATIVECALL;
+}
+
+static std::string buildArgumentExpression(ExpressionContext& context, int valueId, int depth, bool isLastArgument) {
+    std::string expression = buildExpression(context, valueId, depth);
+    if (!isLastArgument || expression == "...") {
+        return expression;
+    }
+
+    const SSAInstruction* def = definingInstruction(context.analyzed, valueId);
+    if (def && isCallInstruction(*def)) {
+        return "(" + expression + ")";
+    }
+    return expression;
 }
 
 static std::string buildCallExpression(ExpressionContext& context, const SSAInstruction& instruction, int depth) {
@@ -764,7 +791,7 @@ static std::string buildCallExpression(ExpressionContext& context, const SSAInst
                 if (i > 2) {
                     out << ", ";
                 }
-                out << buildExpression(context, instruction.uses[i], depth);
+                out << buildArgumentExpression(context, instruction.uses[i], depth, i + 1 == instruction.uses.size());
             }
             out << ")";
             return out.str();
@@ -785,10 +812,190 @@ static std::string buildCallExpression(ExpressionContext& context, const SSAInst
         if (i > 1) {
             out << ", ";
         }
-        out << buildExpression(context, instruction.uses[i], depth);
+        out << buildArgumentExpression(context, instruction.uses[i], depth, i + 1 == instruction.uses.size());
     }
     out << ")";
     return out.str();
+}
+
+static bool isInlineableValueConstructorImport(const std::string& importName) {
+    static const std::unordered_set<std::string> kConstructors = {
+        "Color3.new",
+        "Color3.fromRGB",
+        "Color3.fromHSV",
+        "NumberRange.new",
+    };
+    return kConstructors.count(importName) != 0;
+}
+
+static const SSAInstruction* inlineableValueConstructorCall(ExpressionContext& context, int valueId) {
+    if (valueId < 0 || valueId >= (int)context.analyzed.values.size()) {
+        return nullptr;
+    }
+
+    const auto& value = context.analyzed.values[valueId];
+    if (value.isPhi || value.isParameter || value.isUpvalue || value.useCount != 1 ||
+        context.symbolicMutableValues.count(valueId) ||
+        context.capturedMutableValues.count(valueId) ||
+        context.closureCapturedValues.count(valueId)) {
+        return nullptr;
+    }
+
+    const SSAInstruction* def = definingInstruction(context.analyzed, valueId);
+    if (!def || def->defs.size() != 1 || def->defs.front() != valueId ||
+        (def->inst.stdOp != OP_CALL && def->inst.stdOp != OP_NATIVECALL) ||
+        def->uses.empty()) {
+        return nullptr;
+    }
+
+    const SSAInstruction* calleeDef = definingInstruction(context.analyzed, def->uses.front());
+    if (!calleeDef || calleeDef->inst.stdOp != OP_GETIMPORT ||
+        !calleeDef->inst.importName.has_value() ||
+        !isInlineableValueConstructorImport(*calleeDef->inst.importName)) {
+        return nullptr;
+    }
+
+    for (size_t i = 1; i < def->uses.size(); ++i) {
+        int argValueId = def->uses[i];
+        if (argValueId < 0 || argValueId >= (int)context.analyzed.values.size()) {
+            return nullptr;
+        }
+        if (context.symbolicMutableValues.count(argValueId) ||
+            context.capturedMutableValues.count(argValueId) ||
+            context.closureCapturedValues.count(argValueId) ||
+            isSideEffectingValue(context.analyzed, argValueId)) {
+            return nullptr;
+        }
+    }
+
+    return def;
+}
+
+static void inlineValueConstructorEntry(ExpressionContext& context, TableEntry& entry, int sourceValueId) {
+    if (const SSAInstruction* call = inlineableValueConstructorCall(context, sourceValueId)) {
+        entry.valueExpression = buildCallExpression(context, *call, 0);
+        context.foldedInstructions.insert(call->index);
+    }
+}
+
+static bool isBlockedInlineCalleeName(const std::string& name) {
+    static const std::unordered_set<std::string> kBlocked = {
+        "require",
+        "error",
+        "assert",
+        "pcall",
+        "xpcall",
+    };
+    return kBlocked.count(name) != 0;
+}
+
+static bool hasBlockedInlineCallee(ExpressionContext& context, const SSAInstruction& instruction) {
+    if (instruction.uses.empty()) {
+        return true;
+    }
+
+    const SSAInstruction* calleeDef = definingInstruction(context.analyzed, instruction.uses.front());
+    if (!calleeDef) {
+        return false;
+    }
+    if (calleeDef->inst.stdOp == OP_GETIMPORT && calleeDef->inst.importName.has_value()) {
+        return isBlockedInlineCalleeName(*calleeDef->inst.importName);
+    }
+    if (calleeDef->inst.stdOp == OP_GETGLOBAL && calleeDef->inst.keyName.has_value()) {
+        return isBlockedInlineCalleeName(*calleeDef->inst.keyName);
+    }
+    return false;
+}
+
+static bool findSingleUseInstruction(ExpressionContext& context, int valueId, const SSAInstruction** useInstruction,
+                                     size_t* useIndex) {
+    int useCount = 0;
+    const SSAInstruction* foundInstruction = nullptr;
+    size_t foundIndex = 0;
+
+    for (const auto& instruction : context.analyzed.instructions) {
+        for (size_t i = 0; i < instruction.uses.size(); ++i) {
+            if (instruction.uses[i] != valueId) {
+                continue;
+            }
+            ++useCount;
+            foundInstruction = &instruction;
+            foundIndex = i;
+            if (useCount > 1) {
+                return false;
+            }
+        }
+    }
+
+    if (useCount != 1 || !foundInstruction) {
+        return false;
+    }
+    if (useInstruction) {
+        *useInstruction = foundInstruction;
+    }
+    if (useIndex) {
+        *useIndex = foundIndex;
+    }
+    return true;
+}
+
+static bool hasInterveningSideEffects(ExpressionContext& context, const SSAInstruction& defInstruction,
+                                      const SSAInstruction& useInstruction) {
+    if (defInstruction.blockId != useInstruction.blockId || defInstruction.index >= useInstruction.index) {
+        return true;
+    }
+
+    for (int index = defInstruction.index + 1; index < useInstruction.index; ++index) {
+        if (index < 0 || index >= (int)context.analyzed.instructions.size()) {
+            return true;
+        }
+        const SSAInstruction& instruction = context.analyzed.instructions[index];
+        if (instruction.dead) {
+            continue;
+        }
+        if (instruction.hasSideEffects && instruction.inst.stdOp != OP_NAMECALL) {
+            return true;
+        }
+    }
+    return false;
+}
+
+static bool canInlineSingleUseCallValue(ExpressionContext& context, int valueId) {
+    if (valueId < 0 || valueId >= (int)context.analyzed.values.size()) {
+        return false;
+    }
+
+    const auto& value = context.analyzed.values[valueId];
+    if (value.isPhi || value.isParameter || value.isUpvalue || value.useCount != 1 ||
+        context.symbolicMutableValues.count(valueId) ||
+        context.capturedMutableValues.count(valueId) ||
+        context.closureCapturedValues.count(valueId)) {
+        return false;
+    }
+
+    const SSAInstruction* def = definingInstruction(context.analyzed, valueId);
+    if (!def || !isCallInstruction(*def) || def->defs.size() != 1 || def->defs.front() != valueId ||
+        def->uses.empty()) {
+        return false;
+    }
+    if (def->inst.stdOp == OP_CALL && def->inst.c != 2) {
+        return false;
+    }
+    if (hasBlockedInlineCallee(context, *def)) {
+        return false;
+    }
+
+    const SSAInstruction* useInstruction = nullptr;
+    size_t useIndex = 0;
+    if (!findSingleUseInstruction(context, valueId, &useInstruction, &useIndex) || !useInstruction) {
+        return false;
+    }
+    (void)useIndex;
+
+    if (hasInterveningSideEffects(context, *def, *useInstruction)) {
+        return false;
+    }
+    return true;
 }
 
 static std::vector<std::string> collectClosureCaptureAliases(ExpressionContext& context, const SSAInstruction& closureInstruction, const Function& childFunction) {
@@ -1174,6 +1381,9 @@ static std::string renderClosureExpression(ExpressionContext& context, const SSA
     if (!childFunction.has_value()) {
         return context.analyzed.values[instruction.defs.front()].name;
     }
+    if (!g_inlineClosureBodies.load(std::memory_order_relaxed)) {
+        return canonicalProtoName(**childFunction);
+    }
 
     std::vector<std::string> captureAliases = resolveClosureCaptureAliases(context, instruction, **childFunction);
     AstFunction childAst = context.aliasesByFunction
@@ -1219,7 +1429,7 @@ static bool isWeakAlias(const std::string& alias) {
 static bool isGenericSemanticAlias(const std::string& alias) {
     static const std::unordered_set<std::string> genericAliases = {
         "result", "closure", "value", "item", "entry", "condition",
-        "count", "index", "table", "merge", "text", "formatted"
+        "count", "flag", "index", "table", "merge", "text", "formatted"
     };
 
     if (genericAliases.count(alias) != 0) {
@@ -1366,9 +1576,59 @@ static void initializeSlotAliases(ExpressionContext& context) {
         if (choice.specificCandidates.size() > 1) {
             continue;
         }
-        std::string selected = !choice.bestSpecificAlias.empty() ? choice.bestSpecificAlias : choice.bestAnyAlias;
+        std::string selected = choice.bestSpecificAlias;
         if (!selected.empty()) {
             context.slotAliases[slot] = selected;
+        }
+    }
+
+    auto hasStateUpdateForSlot = [&](int slot) {
+        for (const auto& instruction : context.analyzed.instructions) {
+            if (instruction.defs.size() != 1 || instruction.uses.empty()) {
+                continue;
+            }
+            int defValueId = instruction.defs.front();
+            if (defValueId < 0 || defValueId >= (int)context.analyzed.values.size() ||
+                context.analyzed.values[defValueId].slot != slot) {
+                continue;
+            }
+            for (int useValueId : instruction.uses) {
+                if (useValueId >= 0 && useValueId < (int)context.analyzed.values.size() &&
+                    context.analyzed.values[useValueId].slot == slot) {
+                    return true;
+                }
+            }
+        }
+        return false;
+    };
+
+    for (const auto& instruction : context.analyzed.instructions) {
+        if (instruction.inst.stdOp != OP_MOVE || instruction.defs.size() != 1 || instruction.uses.size() != 1) {
+            continue;
+        }
+
+        int defValueId = instruction.defs.front();
+        int sourceValueId = instruction.uses.front();
+        if (defValueId < 0 || defValueId >= (int)context.analyzed.values.size() ||
+            sourceValueId < 0 || sourceValueId >= (int)context.analyzed.values.size()) {
+            continue;
+        }
+
+        const auto& defValue = context.analyzed.values[defValueId];
+        const auto& sourceValue = context.analyzed.values[sourceValueId];
+        if (!sourceValue.isParameter || defValue.slot < context.sourceFunction.numParams ||
+            context.slotAliases.count(defValue.slot) != 0 || !hasStateUpdateForSlot(defValue.slot)) {
+            continue;
+        }
+
+        std::string targetDefault = localNameForSlot(context.sourceFunction, defValue.slot);
+        if (!isRegisterLikeAlias(targetDefault)) {
+            continue;
+        }
+
+        std::string sourceAlias = localNameForSlot(context.sourceFunction, sourceValue.slot);
+        if (isLuaIdentifier(sourceAlias)) {
+            context.slotAliases[defValue.slot] = sourceAlias;
         }
     }
 }
@@ -1386,6 +1646,10 @@ static std::string assignmentTargetForValue(ExpressionContext& context, int valu
         return "_";
     }
     const auto& value = context.analyzed.values[valueId];
+    const SSAInstruction* def = definingInstruction(context.analyzed, valueId);
+    if (def && isCallInstruction(*def)) {
+        return sanitizeLuaIdentifier(value.name, value.slot >= 0 ? slotAliasFor(context, value.slot) : "result");
+    }
     if (value.slot >= 0) {
         std::string alias = normalizeStructuredAlias(context, value.slot, value.name);
         if (!isLuaIdentifier(alias)) {
@@ -1711,6 +1975,14 @@ static std::optional<std::string> renderNamedClosureDefinition(ExpressionContext
         return std::nullopt;
     }
 
+    auto childFunction = resolveChildFunction(context, *closureInstruction);
+    if (!childFunction.has_value()) {
+        return std::nullopt;
+    }
+    if (!g_inlineClosureBodies.load(std::memory_order_relaxed)) {
+        return qualifiedName + " = " + canonicalProtoName(**childFunction);
+    }
+
     auto childAst = buildClosureAst(context, *closureInstruction);
     if (!childAst.has_value()) {
         return std::nullopt;
@@ -1819,6 +2091,23 @@ static std::string buildExpression(ExpressionContext& context, int valueId, int 
         if (const PhiNode* phi = phiForValue(context, valueId)) {
             if (context.symbolicMutableValues.count(valueId)) {
                 result = normalizeStructuredAlias(context, value.slot, value.name);
+            } else if (context.symbolicPhiValues.count(valueId)) {
+                std::optional<int> parameterInput;
+                for (const auto& [pred, inputValueId] : phi->inputs) {
+                    (void)pred;
+                    if (inputValueId >= 0 && inputValueId < (int)context.analyzed.values.size() &&
+                        context.analyzed.values[inputValueId].isParameter) {
+                        parameterInput = inputValueId;
+                        break;
+                    }
+                }
+                if (parameterInput.has_value()) {
+                    result = buildExpression(context, *parameterInput, depth);
+                } else if (value.slot >= 0 && value.slot < context.sourceFunction.numParams) {
+                    result = slotAliasFor(context, value.slot);
+                } else {
+                    result = normalizeStructuredAlias(context, value.slot, value.name);
+                }
             } else if (auto representative = choosePhiRepresentative(context, *phi); representative.has_value()) {
                 result = buildExpression(context, *representative, depth);
             } else {
@@ -1835,16 +2124,22 @@ static std::string buildExpression(ExpressionContext& context, int valueId, int 
         }
     } else {
         if (!def) {
-            result = value.slot >= 0
+            if (value.slot >= 0 && value.slot < context.sourceFunction.numParams) {
+                result = slotAliasFor(context, value.slot);
+            } else {
+                result = value.slot >= 0
                 ? normalizeStructuredAlias(context, value.slot, value.name)
                 : value.name;
+            }
+        } else if (context.foldedCallExpressions.count(def->index) != 0 && isCallInstruction(*def)) {
+            result = buildCallExpression(context, *def, depth);
         } else if (isSideEffectingValue(context.analyzed, valueId) &&
                    def->inst.stdOp != OP_NEWTABLE &&
                    def->inst.stdOp != OP_DUPTABLE &&
                    def->inst.stdOp != OP_NEWCLOSURE &&
                    def->inst.stdOp != OP_DUPCLOSURE) {
             result = value.slot >= 0
-                ? normalizeStructuredAlias(context, value.slot, value.name)
+                ? sanitizeLuaIdentifier(value.name, slotAliasFor(context, value.slot))
                 : value.name;
         } else {
             auto useExpr = [&](size_t idx) -> std::string {
@@ -1889,6 +2184,9 @@ static std::string buildExpression(ExpressionContext& context, int valueId, int 
                     break;
                 case OP_GETTABLEN:
                     result = formatIndexAccess(useExpr(0), std::to_string((int)def->inst.c + 1));
+                    break;
+                case OP_GETVARARGS:
+                    result = "...";
                     break;
                 case OP_CONCAT: {
                     std::ostringstream out;
@@ -1983,6 +2281,38 @@ static void prepareTableConstructions(ExpressionContext& context) {
             if (instruction.defs.size() == 1) {
                 TableConstruction table;
                 table.resultValueId = instruction.defs.front();
+                if (instruction.inst.stdOp == OP_DUPTABLE &&
+                    instruction.inst.d >= 0 &&
+                    instruction.inst.d < (int)context.sourceFunction.constants.size()) {
+                    const Constant& templateConstant = context.sourceFunction.constants[instruction.inst.d];
+                    if (templateConstant.type == ConstantType::TableWithConstants) {
+                        for (size_t i = 0; i < templateConstant.tableKeys.size() && i < templateConstant.tableConstantValues.size(); ++i) {
+                            int valueIndex = templateConstant.tableConstantValues[i];
+                            if (valueIndex < 0 || valueIndex >= (int)context.sourceFunction.constants.size()) {
+                                continue;
+                            }
+
+                            int keyIndex = templateConstant.tableKeys[i];
+                            if (keyIndex < 0 || keyIndex >= (int)context.sourceFunction.constants.size()) {
+                                continue;
+                            }
+
+                            const Constant& keyConstant = context.sourceFunction.constants[keyIndex];
+                            TableEntry entry;
+                            if (keyConstant.type == ConstantType::String) {
+                                if (isIdentifierKey(keyConstant.strVal)) {
+                                    entry.namedKey = keyConstant.strVal;
+                                } else {
+                                    entry.keyExpression = keyConstant.toString(context.chunk.strings);
+                                }
+                            } else {
+                                entry.keyExpression = normalizeLiteral(keyConstant.toString(context.chunk.strings));
+                            }
+                            entry.valueExpression = normalizeLiteral(context.sourceFunction.constants[valueIndex].toString(context.chunk.strings));
+                            table.entries.push_back(std::move(entry));
+                        }
+                    }
+                }
                 context.tables[table.resultValueId] = std::move(table);
             }
             continue;
@@ -2044,6 +2374,7 @@ static void prepareTableConstructions(ExpressionContext& context) {
                 TableEntry entry;
                 entry.namedKey = instruction.inst.keyName.value_or("key");
                 entry.valueId = sourceValueId;
+                inlineValueConstructorEntry(context, entry, sourceValueId);
                 it->second.entries.push_back(std::move(entry));
                 context.foldedInstructions.insert(instruction.index);
             }
@@ -2062,6 +2393,7 @@ static void prepareTableConstructions(ExpressionContext& context) {
                 TableEntry entry;
                 entry.keyValueId = keyValueId;
                 entry.valueId = sourceValueId;
+                inlineValueConstructorEntry(context, entry, sourceValueId);
                 it->second.entries.push_back(std::move(entry));
                 context.foldedInstructions.insert(instruction.index);
             }
@@ -2079,6 +2411,7 @@ static void prepareTableConstructions(ExpressionContext& context) {
                 TableEntry entry;
                 entry.numericKey = (int)instruction.inst.c + 1;
                 entry.valueId = sourceValueId;
+                inlineValueConstructorEntry(context, entry, sourceValueId);
                 it->second.entries.push_back(std::move(entry));
                 context.foldedInstructions.insert(instruction.index);
             }
@@ -2094,6 +2427,7 @@ static void prepareTableConstructions(ExpressionContext& context) {
                 for (size_t i = 1; i < instruction.uses.size(); ++i) {
                     TableEntry entry;
                     entry.valueId = instruction.uses[i];
+                    inlineValueConstructorEntry(context, entry, instruction.uses[i]);
                     it->second.entries.push_back(std::move(entry));
                 }
                 context.foldedInstructions.insert(instruction.index);
@@ -2126,6 +2460,22 @@ static void prepareTableConstructions(ExpressionContext& context) {
             }
         }
     }
+}
+
+static void prepareInlineableCallExpressions(ExpressionContext& context) {
+    for (const auto& value : context.analyzed.values) {
+        if (!canInlineSingleUseCallValue(context, value.id)) {
+            continue;
+        }
+
+        const SSAInstruction* def = definingInstruction(context.analyzed, value.id);
+        if (!def) {
+            continue;
+        }
+        context.foldedCallExpressions.insert(def->index);
+        context.foldedInstructions.insert(def->index);
+    }
+    context.expressionCache.clear();
 }
 
 static std::string renderCondition(ExpressionContext& context, const SSAInstruction& instruction) {
@@ -3534,9 +3884,12 @@ static AstFunction makeFunctionShell(const Function& sourceFunction) {
     AstFunction function;
     function.name = isUsableFunctionName(sourceFunction.debugName)
         ? sourceFunction.debugName
-        : ("proto_" + std::to_string(sourceFunction.id));
+        : canonicalProtoName(sourceFunction);
     for (int slot = 0; slot < sourceFunction.numParams; ++slot) {
         function.params.push_back(localNameForSlot(sourceFunction, slot));
+    }
+    if (sourceFunction.isVararg) {
+        function.params.push_back("...");
     }
     function.body.kind = AstStatementKind::Block;
     return function;
@@ -3662,17 +4015,9 @@ static AstFunction fallbackFunctionToLegacyBody(const Chunk& chunk, const Functi
     body.kind = AstStatementKind::Raw;
     std::string legacyBody = trimSpace(generateFunctionBodyCode(chunk, opmap, sourceFunction));
     if (legacyBody.empty()) {
-        legacyBody = "legacy fallback body unavailable";
+        legacyBody = "-- legacy fallback body unavailable";
     }
-    std::ostringstream commented;
-    commented << "-- legacy fallback body (commented for parse safety)\n";
-    std::istringstream lines(legacyBody);
-    std::string line;
-    while (std::getline(lines, line)) {
-        commented << "-- " << line << "\n";
-    }
-    commented << "-- end legacy fallback body";
-    body.text = commented.str();
+    body.text = "-- legacy fallback body emitted\n" + legacyBody;
     fallback.body.body.push_back(std::move(body));
     return fallback;
 }
@@ -3691,6 +4036,7 @@ static AstFunction structureFunctionWithPolicy(const Chunk& chunk, const Functio
         markCapturedMutableSlots(context);
         markClosureCapturedValues(context);
         prepareTableConstructions(context);
+        prepareInlineableCallExpressions(context);
 
         AstFunction function = buildStructuredFunctionFromContext(context);
         StructuringQuality quality = evaluateStructuredQuality(function, analyzed);
@@ -3764,15 +4110,65 @@ std::string formatStructuredSource(const Chunk& chunk, const OpcodeMap& opmap) {
     out << "-- ============================================\n\n";
     out << "-- Backend: structured-ast\n\n";
 
-    std::string body = formatAstChunk(structureMainFunction(chunk, opmap));
-    out << body;
-    if (!body.empty() && body.back() != '\n') {
-        out << "\n";
+    g_inlineClosureBodies.store(false, std::memory_order_relaxed);
+
+    std::unordered_map<int, std::vector<std::string>> aliasesByFunction;
+    if (chunk.mainIndex >= 0 && chunk.mainIndex < (int)chunk.functions.size()) {
+        collectStructuredAliasesRecursive(chunk, chunk.functions[chunk.mainIndex], opmap, {}, aliasesByFunction);
+    }
+
+    auto functionChunks = formatFunctionsParallel(chunk.functions, [&](const Function& function) {
+        if (function.id == chunk.mainIndex) {
+            return std::string{};
+        }
+
+        auto aliasIt = aliasesByFunction.find(function.id);
+        AstFunction ast = structureFunctionWithAliases(
+            chunk,
+            function,
+            opmap,
+            aliasIt != aliasesByFunction.end() ? aliasIt->second : std::vector<std::string>{},
+            aliasesByFunction
+        );
+        ast.name = canonicalProtoName(function);
+
+        std::ostringstream chunkOut;
+        if (!function.debugName.empty()) {
+            chunkOut << "-- debug name: " << function.debugName << "\n";
+        }
+        chunkOut << formatAstFunction(ast) << "\n";
+        return chunkOut.str();
+    });
+
+    bool emittedFunction = false;
+    for (const auto& chunkText : functionChunks) {
+        if (!chunkText.empty()) {
+            out << chunkText;
+            emittedFunction = true;
+        }
+    }
+    if (emittedFunction) {
+        out << "-- Main entry body: proto_" << chunk.mainIndex << "\n";
+    }
+
+    std::string body;
+    if (chunk.mainIndex >= 0 && chunk.mainIndex < (int)chunk.functions.size()) {
+        AstFunction mainAst = structureFunctionWithAliases(chunk, chunk.functions[chunk.mainIndex], opmap, {}, aliasesByFunction);
+        mainAst.name = canonicalProtoName(chunk.functions[chunk.mainIndex]);
+        body = formatAstChunk(mainAst);
+        out << body;
+        if (!body.empty() && body.back() != '\n') {
+            out << "\n";
+        }
+    } else {
+        out << "-- Missing main entry\n";
     }
     out << "\n-- Structured functions processed: "
         << g_structuredFunctionsProcessed.load(std::memory_order_relaxed) << "\n";
     out << "-- Structured fallbacks used: "
         << g_structuredFunctionsFallback.load(std::memory_order_relaxed) << "\n";
+
+    g_inlineClosureBodies.store(true, std::memory_order_relaxed);
     return out.str();
 }
 
@@ -3798,6 +4194,7 @@ std::string formatStructuredAst(const Chunk& chunk, const OpcodeMap& opmap) {
             aliasIt != aliasesByFunction.end() ? aliasIt->second : std::vector<std::string>{},
             aliasesByFunction
         );
+        ast.name = canonicalProtoName(function);
         return formatAstFunction(ast) + "\n";
     });
 

@@ -5,6 +5,7 @@
 #include <cstdio>
 #include <cmath>
 #include <cctype>
+#include <limits>
 #include <stdexcept>
 
 namespace {
@@ -24,6 +25,21 @@ static int readBoundedVarInt(BytecodeReader& r, size_t maxValue, const char* wha
         throw std::runtime_error(std::string("Invalid ") + what + " count: " + std::to_string(value));
     }
     return value;
+}
+
+static uint64_t readVarUInt64(BytecodeReader& r) {
+    size_t start = r.position();
+    uint64_t result = 0;
+    int shift = 0;
+    for (int i = 0; i < 10; ++i) {
+        uint8_t byte = r.readByte();
+        result |= (uint64_t)(byte & 0x7f) << shift;
+        if ((byte & 0x80) == 0) {
+            return result;
+        }
+        shift += 7;
+    }
+    throw std::runtime_error("Malformed 64-bit varint in bytecode at offset " + std::to_string(start));
 }
 
 static std::string escapeLuaStringLiteral(const std::string& value) {
@@ -74,7 +90,7 @@ std::string Constant::toString(const std::vector<std::string>& strings) const {
             if (std::isinf(numVal))
                 return numVal < 0 ? "-math.huge" : "math.huge";
             // Pretty print integers vs floats
-            if (numVal == (double)(int64_t)numVal && std::abs(numVal) < 1e15)
+            if (numVal == (double)(int64_t)numVal && std::abs(numVal) <= 9007199254740992.0)
                 return std::to_string((int64_t)numVal);
             char buf[64];
             snprintf(buf, sizeof(buf), "%.14g", numVal);
@@ -105,7 +121,10 @@ std::string Constant::toString(const std::vector<std::string>& strings) const {
             return s;
         }
         case ConstantType::Table:
+        case ConstantType::TableWithConstants:
             return "{table:" + std::to_string(tableKeys.size()) + " keys}";
+        case ConstantType::Integer:
+            return std::to_string(intVal);
         case ConstantType::Closure:
             return "<closure proto#" + std::to_string(closureIdx) + ">";
         case ConstantType::Vector: {
@@ -146,7 +165,7 @@ static Constant readConstant(BytecodeReader& r, const std::vector<std::string>& 
 
     // Some protected/custom chunks encode constant tags with high bits.
     // Preserve low-bit semantic tag as a best-effort recovery path.
-    if (type > 7 && type != 9 && type != 64) {
+    if (type > 10 && type != 64) {
         type = type & 7;
         if (remapWarnCount < 32) {
             fprintf(stderr, "[*] Remapped constant type %u -> %u\n", (unsigned)rawType, (unsigned)type);
@@ -158,7 +177,6 @@ static Constant readConstant(BytecodeReader& r, const std::vector<std::string>& 
 
     switch (c.type) {
         case 64:
-        case 9:
         case ConstantType::Nil:
             break;
         case ConstantType::Bool:
@@ -191,6 +209,29 @@ static Constant readConstant(BytecodeReader& r, const std::vector<std::string>& 
             int size = readBoundedVarInt(r, remainingBytes(r), "table constant key");
             for (int i = 0; i < size; i++)
                 c.tableKeys.push_back(r.readVarInt());
+            break;
+        }
+        case ConstantType::TableWithConstants: {
+            int size = readBoundedVarInt(r, remainingBytes(r) / 5, "table-with-constants key");
+            for (int i = 0; i < size; i++) {
+                c.tableKeys.push_back(r.readVarInt());
+                c.tableConstantValues.push_back(r.readInt32());
+            }
+            break;
+        }
+        case ConstantType::Integer: {
+            uint8_t sign = r.readByte();
+            uint64_t magnitude = readVarUInt64(r);
+            uint64_t int64Max = (uint64_t)std::numeric_limits<int64_t>::max();
+            if (sign) {
+                if (magnitude >= int64Max + 1) {
+                    c.intVal = std::numeric_limits<int64_t>::min();
+                } else {
+                    c.intVal = -(int64_t)magnitude;
+                }
+            } else {
+                c.intVal = magnitude > int64Max ? std::numeric_limits<int64_t>::max() : (int64_t)magnitude;
+            }
             break;
         }
         case ConstantType::Closure:

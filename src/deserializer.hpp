@@ -17,6 +17,8 @@ enum class ConstantType : uint8_t {
     Table   = 5,
     Closure = 6,
     Vector  = 7,
+    TableWithConstants = 8,
+    Integer = 9,
 };
 
 struct Constant {
@@ -29,8 +31,10 @@ struct Constant {
     std::vector<std::string> importNames;
     // Table: key indices
     std::vector<int> tableKeys;
+    std::vector<int32_t> tableConstantValues;
     // Closure: proto index
     int closureIdx   = 0;
+    int64_t intVal   = 0;
     // Vector
     float vecX = 0, vecY = 0, vecZ = 0, vecW = 0;
 

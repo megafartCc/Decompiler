@@ -1704,6 +1704,27 @@ std::string formatAnalyzedSSA(const Chunk& chunk, const OpcodeMap& opmap) {
     auto chunks = formatFunctionsParallel(chunk.functions, [&](const Function& function) {
         std::ostringstream fnOut;
         SSAFunction analyzed = analyzeFunction(chunk, function, opmap);
+        auto valueName = [&](int valueId) -> std::string {
+            if (valueId < 0 || valueId >= (int)analyzed.values.size()) {
+                return "<invalid:" + std::to_string(valueId) + ">";
+            }
+            return analyzed.values[valueId].name;
+        };
+        auto valueWithMetadata = [&](int valueId) -> std::string {
+            if (valueId < 0 || valueId >= (int)analyzed.values.size()) {
+                return "<invalid:" + std::to_string(valueId) + ">";
+            }
+            const auto& value = analyzed.values[valueId];
+            std::ostringstream text;
+            text << value.name;
+            text << "#s" << value.slot;
+            text << "@" << std::fixed << std::setprecision(2) << value.nameConfidence;
+            if (value.constantValue.has_value()) {
+                text << "=" << *value.constantValue;
+            }
+            return text.str();
+        };
+
         fnOut << "Function proto#" << function.id;
         if (!function.debugName.empty()) {
             fnOut << " \"" << function.debugName << "\"";
@@ -1719,18 +1740,13 @@ std::string formatAnalyzedSSA(const Chunk& chunk, const OpcodeMap& opmap) {
                 if (phi.dead) {
                     continue;
                 }
-                const auto& result = analyzed.values[phi.resultValueId];
-                fnOut << "    phi " << result.name;
-                fnOut << "@" << std::fixed << std::setprecision(2) << result.nameConfidence;
-                if (result.constantValue.has_value()) {
-                    fnOut << " = " << *result.constantValue;
-                }
+                fnOut << "    phi " << valueWithMetadata(phi.resultValueId);
                 fnOut << " <- ";
                 bool first = true;
                 for (const auto& [pred, valueId] : phi.inputs) {
                     if (!first) fnOut << ", ";
                     first = false;
-                    fnOut << "b" << pred << ":" << analyzed.values[valueId].name;
+                    fnOut << "b" << pred << ":" << valueName(valueId);
                 }
                 fnOut << "\n";
             }
@@ -1744,26 +1760,21 @@ std::string formatAnalyzedSSA(const Chunk& chunk, const OpcodeMap& opmap) {
                     fnOut << " defs=";
                     for (size_t i = 0; i < instruction.defs.size(); ++i) {
                         if (i) fnOut << ", ";
-                        const auto& value = analyzed.values[instruction.defs[i]];
-                        fnOut << value.name;
-                        fnOut << "@" << std::fixed << std::setprecision(2) << value.nameConfidence;
-                        if (value.constantValue.has_value()) {
-                            fnOut << "=" << *value.constantValue;
-                        }
+                        fnOut << valueWithMetadata(instruction.defs[i]);
                     }
                 }
                 if (!instruction.uses.empty()) {
                     fnOut << " uses=";
                     for (size_t i = 0; i < instruction.uses.size(); ++i) {
                         if (i) fnOut << ", ";
-                        fnOut << analyzed.values[instruction.uses[i]].name;
+                        fnOut << valueName(instruction.uses[i]);
                     }
                 }
                 if (!instruction.clobberDefs.empty()) {
                     fnOut << " clobber=";
                     for (size_t i = 0; i < instruction.clobberDefs.size(); ++i) {
                         if (i) fnOut << ", ";
-                        fnOut << analyzed.values[instruction.clobberDefs[i]].name;
+                        fnOut << valueName(instruction.clobberDefs[i]);
                     }
                 }
                 if (!instruction.semanticHint.empty()) {
